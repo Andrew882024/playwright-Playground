@@ -1,11 +1,12 @@
 """
 Open Instagram in Playwright using cookies from .env (see translate_instagram_cookie_into_playwright_version.py).
-Optional INSTAGRAM_PROFILE_USERNAME in .env: after load, clicks that profile link (or opens /username/ if no link).
+Optional INSTAGRAM_PROFILE_USERNAME in .env: after load, opens your profile, then opens the Following list.
 Uses a persistent Firefox profile and notification permission so site state survives runs; screenshot → test_Instagram/.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,24 @@ def _open_profile(page, username: str) -> None:
     except Exception:
         page.goto(profile, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(1500)
+
+
+def _open_following_list(page) -> None:
+    """On profile page, click Following (stats row or /username/following/ link) and wait for the modal if shown."""
+    try:
+        page.locator('a[href*="/following"]').first.click(timeout=12_000)
+    except Exception:
+        try:
+            page.get_by_role("link", name=re.compile(r"following", re.I)).first.click(timeout=12_000)
+        except Exception:
+            page.locator("span").filter(has_text=re.compile(r"^\s*following\s*$", re.I)).first.click(
+                timeout=8_000
+            )
+    page.wait_for_timeout(1500)
+    try:
+        page.locator('[role="dialog"]').first.wait_for(state="visible", timeout=10_000)
+    except Exception:
+        pass
 
 
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
@@ -77,6 +96,7 @@ def main() -> None:
         profile_user = read_instagram_profile_username()
         if profile_user:
             _open_profile(page, profile_user)
+            _open_following_list(page)
         page.screenshot(path=str(out_path), full_page=True)
         context.close()
 
