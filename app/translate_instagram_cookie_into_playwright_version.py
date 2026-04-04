@@ -176,3 +176,14 @@ def read_instagram_target_url() -> str:
         or (_read_scalar_env(env_path, "INSTAGRAM_TARGET_URL") or "")
         or "https://www.instagram.com/"
     )
+
+
+def read_instagram_profile_username() -> str | None:
+    """Instagram handle (no @) from env or .env (optional INSTAGRAM_PROFILE_USERNAME)."""
+    env_path = PROJECT_ROOT / ".env"
+    u = (
+        os.environ.get("INSTAGRAM_PROFILE_USERNAME", "").strip()
+        or (_read_scalar_env(env_path, "INSTAGRAM_PROFILE_USERNAME") or "")
+    )
+    u = u.lstrip("@").strip()
+    return u or None

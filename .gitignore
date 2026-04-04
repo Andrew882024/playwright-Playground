@@ -1,2 +1,3 @@
 venv/
 .playwright_instagram_profile/
+.env
