@@ -1,6 +1,6 @@
 """
 Open Instagram in Playwright using cookies from .env (see translate_instagram_cookie_into_playwright_version.py).
-Screenshot is written to test_Instagram/ at the project root.
+Uses a persistent Firefox profile and notification permission so site state survives runs; screenshot → test_Instagram/.
 """
 
 from __future__ import annotations
@@ -21,6 +21,22 @@ from translate_instagram_cookie_into_playwright_version import (  # noqa: E402
 )
 
 SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
+# Same folder each run = Firefox remembers cookies, localStorage, and notification permission for the origin.
+# grant_permissions() + one in-page click (below) match site settings + Instagram’s own “already answered” state.
+PERSISTENT_PROFILE_DIR = PROJECT_ROOT / ".playwright_instagram_profile"
+INSTAGRAM_ORIGIN = "https://www.instagram.com"
+
+
+def _dismiss_instagram_notification_prompt_if_present(page) -> None:
+    """Click Not Now or Turn On when the sheet is visible so Instagram stores it in this profile."""
+    choice = page.get_by_role("button", name="Not Now").or_(
+        page.get_by_role("button", name="Turn On")
+    )
+    try:
+        choice.first.click(timeout=2_000)
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -28,21 +44,24 @@ def main() -> None:
     target = read_instagram_target_url()
 
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    PERSISTENT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SCREENSHOT_DIR / "instagram_page.png"
 
     with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        context = browser.new_context(
+        context = p.firefox.launch_persistent_context(
+            str(PERSISTENT_PROFILE_DIR),
+            headless=False,
             locale="en-US",
             viewport={"width": 1280, "height": 900},
         )
+        context.grant_permissions(["notifications"], origin=INSTAGRAM_ORIGIN)
         context.add_cookies(cookies)
         page = context.new_page()
         page.goto(target, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(3000)
+        _dismiss_instagram_notification_prompt_if_present(page)
         page.screenshot(path=str(out_path), full_page=True)
         context.close()
-        browser.close()
 
     print(f"Screenshot saved to {out_path}")
 
