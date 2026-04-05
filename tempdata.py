@@ -1,0 +1,1 @@
+following_usernames = ["seventhcollegestudentcouncil","ttv.ucsd","acm.at.ucsd","eighthcollege"]
