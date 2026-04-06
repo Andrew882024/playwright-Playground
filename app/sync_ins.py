@@ -23,6 +23,10 @@ from translate_instagram_cookie_into_playwright_version import (  # noqa: E402
     read_instagram_target_url,
 )
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from tempdata import following_usernames  # noqa: E402
+
 SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
 # Same folder each run = Firefox remembers cookies, localStorage, and notification permission for the origin.
 # grant_permissions() + one in-page click (below) match site settings + Instagram’s own “already answered” state.
@@ -58,6 +62,39 @@ def _open_following_list(page) -> None:
         page.locator('[role="dialog"]').first.wait_for(state="visible", timeout=10_000)
     except Exception:
         pass
+
+def _open_following_profile(page, username: str) -> None:
+    """Click the account row inside the open Following modal (not a global .first link — sidebar can be disabled)."""
+    u = username.lstrip("@").strip()
+    dialog = page.locator('[role="dialog"]').first
+    dialog.wait_for(state="visible", timeout=15_000)
+    # Only links inside the modal; page-wide `a[href="..."] .first` hits background UI (disabled under overlay).
+    row_link = dialog.locator(f'a[href="/{u}/"]').first
+    row_link.scroll_into_view_if_needed(timeout=10_000)
+    try:
+        row_link.click(timeout=12_000)
+    except Exception:
+        try:
+            row_link.click(timeout=12_000, force=True)
+        except Exception:
+            row_link.evaluate("el => el.click()")
+    page.wait_for_url(lambda url: f"/{u}/" in url, timeout=25_000)
+    page.wait_for_timeout(1500)
+    _scroll_profile_down(page, times=3)
+    _save_graphql_json(page, u)
+
+
+def _scroll_profile_down(page, times: int) -> None:
+    """Scroll the profile page down a few times to load more content."""
+    for _ in range(times):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+        page.wait_for_timeout(1000)
+
+def _save_graphql_json(page, username: str) -> None:
+    """Save a snapshot of the current page HTML under temp_download."""
+    out_dir = PROJECT_ROOT / "temp_download" / username
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"graphql_{username}.json").write_text(page.content(), encoding="utf-8")
 
 
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
@@ -96,7 +133,18 @@ def main() -> None:
         profile_user = read_instagram_profile_username()
         if profile_user:
             _open_profile(page, profile_user)
-            _open_following_list(page)
+            for username in following_usernames:
+                _open_following_list(page)
+                _open_following_profile(page, username)
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=25_000)
+                except Exception:
+                    page.goto(
+                        f"{INSTAGRAM_ORIGIN}/{profile_user.lstrip('@').strip()}/",
+                        wait_until="domcontentloaded",
+                        timeout=60_000,
+                    )
+                page.wait_for_timeout(500)
         page.screenshot(path=str(out_path), full_page=True)
         context.close()
 
