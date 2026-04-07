@@ -2,3 +2,4 @@ venv/
 .playwright_instagram_profile/
 .env
 temp_download/
+temp_download_raw/

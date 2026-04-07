@@ -1,9 +1,12 @@
 """
 Open Instagram in Playwright using cookies from .env (see translate_instagram_cookie_into_playwright_version.py).
 
-Visits each account in tempdata.py via the Following modal, scrolls the profile, and records
-Instagram GraphQL JSON that contains posts/media (temp_download/<user>/posts_graphql_*.json)
-plus openable_media_urls.json (decoded CDN https URLs — not raw page HTML).
+Visits each account in tempdata.py via the Following modal, scrolls the profile, and records:
+
+- Raw GraphQL bodies: temp_download_raw/<user>/posts_graphql_*.json
+- Clean scrape bundle: temp_download/<user>/posts.json (title, caption as comment, author, links)
+  plus openable_media_urls.json (all CDN URLs from those responses).
+
 Uses a persistent Firefox profile; screenshot → test_Instagram/.
 """
 
@@ -14,7 +17,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from playwright.sync_api import Response, sync_playwright
 
@@ -38,6 +41,8 @@ SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
 # grant_permissions() + one in-page click (below) match site settings + Instagram’s own “already answered” state.
 PERSISTENT_PROFILE_DIR = PROJECT_ROOT / ".playwright_instagram_profile"
 INSTAGRAM_ORIGIN = "https://www.instagram.com"
+TEMP_DOWNLOAD_RAW = PROJECT_ROOT / "temp_download_raw"
+TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 
 # Substrings that suggest this GraphQL JSON carries posts / media / comments (not inbox tray, etc.).
 _POST_GRAPHQL_MARKERS = (
@@ -72,6 +77,119 @@ _MEDIA_URL_KEYS = frozenset(
 
 def _graphql_body_looks_like_posts(body: str) -> bool:
     return any(m in body for m in _POST_GRAPHQL_MARKERS)
+
+
+def _extract_timeline_nodes(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pull media `node` dicts from any `data.*.edges[].node` that has a shortcode (`code`)."""
+    out: list[dict[str, Any]] = []
+    root = data.get("data")
+    if not isinstance(root, dict):
+        return out
+    for v in root.values():
+        if not isinstance(v, dict):
+            continue
+        edges = v.get("edges")
+        if not isinstance(edges, list):
+            continue
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            node = edge.get("node")
+            if isinstance(node, dict) and node.get("code"):
+                out.append(node)
+    return out
+
+
+def _post_title(node: dict[str, Any]) -> str | None:
+    h = node.get("headline")
+    if isinstance(h, str) and h.strip():
+        return h.strip()
+    a = node.get("accessibility_caption")
+    if isinstance(a, str) and a.strip():
+        return a.strip()
+    cap = node.get("caption")
+    if isinstance(cap, dict):
+        text = cap.get("text")
+        if isinstance(text, str) and text.strip():
+            first = text.strip().split("\n", maxsplit=1)[0].strip()
+            return first or None
+    return None
+
+
+def _post_caption_text(node: dict[str, Any]) -> str | None:
+    cap = node.get("caption")
+    if isinstance(cap, dict):
+        t = cap.get("text")
+        if isinstance(t, str):
+            return t or None
+    return None
+
+
+def _from_username(node: dict[str, Any]) -> str | None:
+    u = node.get("user")
+    if isinstance(u, dict):
+        name = u.get("username")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _openable_urls_for_subtree(obj: object) -> list[str]:
+    found: set[str] = set()
+    _collect_cdn_urls(obj, found)
+    return sorted(found)
+
+
+def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[str, Any]) -> None:
+    code = node.get("code")
+    if not isinstance(code, str) or not code:
+        return
+    urls = set(_openable_urls_for_subtree(node))
+    rec = {
+        "shortcode": code,
+        "permalink": f"{INSTAGRAM_ORIGIN}/p/{code}/",
+        "from_username": _from_username(node),
+        "title": _post_title(node),
+        "comment": _post_caption_text(node),
+        "openable_media_urls": sorted(urls),
+        "taken_at": node.get("taken_at"),
+        "media_pk": str(node["pk"]) if node.get("pk") is not None else None,
+    }
+    if code not in by_shortcode:
+        by_shortcode[code] = rec
+        return
+    prev = by_shortcode[code]
+    merged = set(prev["openable_media_urls"]) | urls
+    prev["openable_media_urls"] = sorted(merged)
+    if prev.get("comment") is None and rec.get("comment") is not None:
+        prev["comment"] = rec["comment"]
+    if prev.get("title") is None and rec.get("title") is not None:
+        prev["title"] = rec["title"]
+    if prev.get("from_username") is None and rec.get("from_username") is not None:
+        prev["from_username"] = rec["from_username"]
+
+
+def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict[str, Any]:
+    """Build posts.json payload from all posts_graphql_*.json under raw_dir."""
+    by_shortcode: dict[str, dict[str, Any]] = {}
+    for path in sorted(raw_dir.glob("posts_graphql_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for node in _extract_timeline_nodes(data):
+            _merge_structured_posts(by_shortcode, node)
+    posts = sorted(
+        by_shortcode.values(),
+        key=lambda p: p.get("taken_at") or 0,
+        reverse=True,
+    )
+    return {
+        "scraped_profile": scraped_username,
+        "posts": posts,
+    }
 
 
 def _collect_cdn_urls(obj: object, out: set[str]) -> None:
@@ -168,8 +286,10 @@ def _open_following_list(page) -> None:
 def _open_following_profile(page, username: str) -> None:
     """Click the account row inside the open Following modal (not a global .first link — sidebar can be disabled)."""
     u = username.lstrip("@").strip()
-    out_dir = PROJECT_ROOT / "temp_download" / u
-    gql_handler, finalize = _make_graphql_posts_capture(out_dir)
+    raw_dir = TEMP_DOWNLOAD_RAW / u
+    clean_dir = TEMP_DOWNLOAD / u
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    gql_handler, finalize = _make_graphql_posts_capture(raw_dir)
     page.on("response", gql_handler)
     try:
         dialog = page.locator('[role="dialog"]').first
@@ -191,11 +311,19 @@ def _open_following_profile(page, username: str) -> None:
         page.remove_listener("response", gql_handler)
 
     urls, n_saved = finalize()
-    (out_dir / "openable_media_urls.json").write_text(
+    bundle = structured_bundle_from_raw_dir(raw_dir, u)
+    (clean_dir / "posts.json").write_text(
+        json.dumps(bundle, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (clean_dir / "openable_media_urls.json").write_text(
         json.dumps(urls, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    print(f"  {u}: posts_graphql_*.json × {n_saved}, openable_media_urls.json × {len(urls)} URL(s)")
+    print(
+        f"  {u}: raw posts_graphql × {n_saved} → {raw_dir.relative_to(PROJECT_ROOT)}, "
+        f"posts.json × {len(bundle['posts'])}, openable_media_urls × {len(urls)}"
+    )
 
 
 def _scroll_profile_down(page, times: int) -> None:
