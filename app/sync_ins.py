@@ -5,7 +5,8 @@ Visits each account in tempdata.py via the Following modal, scrolls the profile,
 
 - Raw GraphQL bodies: temp_download_raw/<user>/posts_graphql_*.json
 - Clean scrape bundle: temp_download/<user>/posts.json (title, caption as comment, author, links)
-  plus openable_media_urls.json (all CDN URLs from those responses).
+  plus openable_media_urls.json. Each post's openable_media_urls is
+  {"largest": [...], "other": [...]} — one best-resolution URL per asset, then remaining variants.
 
 Uses a persistent Firefox profile; screenshot → test_Instagram/.
 """
@@ -17,7 +18,8 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Response, sync_playwright
 
@@ -140,6 +142,68 @@ def _openable_urls_for_subtree(obj: object) -> list[str]:
     return sorted(found)
 
 
+def _instagram_url_asset_key(url: str) -> str:
+    """Group CDN variants of the same image (ig_cache_key) or same path filename."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    keys = qs.get("ig_cache_key")
+    if keys:
+        return f"cache:{keys[0]}"
+    path = parsed.path.rstrip("/")
+    fname = path.rsplit("/", 1)[-1] if path else url
+    return f"path:{fname}"
+
+
+def _instagram_url_pixel_score(url: str) -> int:
+    """Higher means larger display size; used to pick one URL per asset."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    stp_parts = qs.get("stp", [])
+    if not stp_parts:
+        return 10_000_000
+    stp = stp_parts[0]
+    best = 0
+    for m in re.finditer(r"[sp](\d+)x(\d+)", stp):
+        w, h = int(m.group(1)), int(m.group(2))
+        best = max(best, w * h)
+    if best == 0:
+        return 9_000_000
+    return best
+
+
+def _coerce_url_set(val: object) -> set[str]:
+    if isinstance(val, set):
+        return {str(x) for x in val}
+    if isinstance(val, list):
+        return {str(x) for x in val}
+    return set()
+
+
+def _organize_instagram_cdn_urls(urls: Iterable[str]) -> dict[str, list[str]]:
+    """Per distinct asset: put the largest variant in largest; all other variants in other."""
+    url_list = sorted(set(urls))
+    by_key: dict[str, list[str]] = {}
+    for u in url_list:
+        by_key.setdefault(_instagram_url_asset_key(u), []).append(u)
+    first_key_order: list[str] = []
+    seen: set[str] = set()
+    for u in url_list:
+        k = _instagram_url_asset_key(u)
+        if k not in seen:
+            seen.add(k)
+            first_key_order.append(k)
+    largest: list[str] = []
+    other: list[str] = []
+    for k in first_key_order:
+        group = by_key[k]
+        winner = max(group, key=_instagram_url_pixel_score)
+        largest.append(winner)
+        for u in sorted(group):
+            if u != winner:
+                other.append(u)
+    return {"largest": largest, "other": other}
+
+
 def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[str, Any]) -> None:
     code = node.get("code")
     if not isinstance(code, str) or not code:
@@ -151,7 +215,7 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
         "from_username": _from_username(node),
         "title": _post_title(node),
         "comment": _post_caption_text(node),
-        "openable_media_urls": sorted(urls),
+        "openable_media_urls": urls,
         "taken_at": node.get("taken_at"),
         "media_pk": str(node["pk"]) if node.get("pk") is not None else None,
     }
@@ -159,8 +223,8 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
         by_shortcode[code] = rec
         return
     prev = by_shortcode[code]
-    merged = set(prev["openable_media_urls"]) | urls
-    prev["openable_media_urls"] = sorted(merged)
+    merged = _coerce_url_set(prev["openable_media_urls"]) | urls
+    prev["openable_media_urls"] = merged
     if prev.get("comment") is None and rec.get("comment") is not None:
         prev["comment"] = rec["comment"]
     if prev.get("title") is None and rec.get("title") is not None:
@@ -186,6 +250,9 @@ def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict
         key=lambda p: p.get("taken_at") or 0,
         reverse=True,
     )
+    for p in posts:
+        raw = p.get("openable_media_urls")
+        p["openable_media_urls"] = _organize_instagram_cdn_urls(_coerce_url_set(raw))
     return {
         "scraped_profile": scraped_username,
         "posts": posts,
@@ -312,17 +379,20 @@ def _open_following_profile(page, username: str) -> None:
 
     urls, n_saved = finalize()
     bundle = structured_bundle_from_raw_dir(raw_dir, u)
+    organized_all = _organize_instagram_cdn_urls(urls)
     (clean_dir / "posts.json").write_text(
         json.dumps(bundle, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     (clean_dir / "openable_media_urls.json").write_text(
-        json.dumps(urls, indent=2, ensure_ascii=False),
+        json.dumps(organized_all, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    n_flat = len(organized_all["largest"]) + len(organized_all["other"])
     print(
         f"  {u}: raw posts_graphql × {n_saved} → {raw_dir.relative_to(PROJECT_ROOT)}, "
-        f"posts.json × {len(bundle['posts'])}, openable_media_urls × {len(urls)}"
+        f"posts.json × {len(bundle['posts'])}, openable_media_urls × {n_flat} "
+        f"({len(organized_all['largest'])} largest / {len(organized_all['other'])} other)"
     )
 
 
