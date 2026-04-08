@@ -397,11 +397,53 @@ def _open_following_profile(page, username: str) -> None:
     )
 
 
+_ONE_HUMAN_SCROLL_JS = """
+async () => {
+    const vh = window.innerHeight;
+    const doc = document.documentElement;
+    const maxScroll = Math.max(0, doc.scrollHeight - vh);
+    const start = window.scrollY;
+    const room = maxScroll - start;
+    if (room <= 2) {
+        return { atBottom: true, durationMs: 0 };
+    }
+    const lo = 0.7 * vh;
+    const hi = 1.0 * vh;
+    let total = lo + Math.random() * (hi - lo);
+    total = Math.min(total, room);
+    total = Math.max(1, total);
+
+    const durationMs = 700 + Math.random() * 900;
+    const easeInOutQuint = (t) =>
+        t < 0.5 ? 16 * t * t * t * t * t : 1 - Math.pow(-2 * t + 2, 5) / 2;
+
+    await new Promise((resolve) => {
+        const t0 = performance.now();
+        function frame(now) {
+            const u = Math.min(1, (now - t0) / durationMs);
+            const eased = easeInOutQuint(u);
+            window.scrollTo(0, start + total * eased);
+            if (u < 1) {
+                requestAnimationFrame(frame);
+            } else {
+                resolve();
+            }
+        }
+        requestAnimationFrame(frame);
+    });
+    return { atBottom: false, durationMs: Math.round(durationMs) };
+}
+"""
+
+
 def _scroll_profile_down(page, times: int) -> None:
-    """Scroll the profile page down a few times to load more content."""
+    """Each scroll: 70–100% of viewport (not tiny chunks), one motion with slow→fast→slow easing."""
     for _ in range(times):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        page.wait_for_timeout(random.randint(1_000, 3_000))
+        result = page.evaluate(_ONE_HUMAN_SCROLL_JS)
+        if isinstance(result, dict) and result.get("atBottom"):
+            page.wait_for_timeout(random.randint(500, 1_400))
+            continue
+        page.wait_for_timeout(random.randint(900, 2_800))
 
 
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
