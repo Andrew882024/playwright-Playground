@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import sys
 from pathlib import Path
@@ -400,7 +401,7 @@ def _scroll_profile_down(page, times: int) -> None:
     """Scroll the profile page down a few times to load more content."""
     for _ in range(times):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(random.randint(1_000, 3_000))
 
 
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
