@@ -47,6 +47,10 @@ INSTAGRAM_ORIGIN = "https://www.instagram.com"
 TEMP_DOWNLOAD_RAW = PROJECT_ROOT / "temp_download_raw"
 TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 
+# Early-exit profile scroll: stop when len(known ∩ this_run) > OVERLAP_STOP_THRESHOLD (e.g. 3+ matches).
+OVERLAP_STOP_THRESHOLD = 2
+MAX_PROFILE_SCROLLS = 10
+
 # Substrings that suggest this GraphQL JSON carries posts / media / comments (not inbox tray, etc.).
 _POST_GRAPHQL_MARKERS = (
     '"shortcode"',
@@ -80,6 +84,28 @@ _MEDIA_URL_KEYS = frozenset(
 
 def _graphql_body_looks_like_posts(body: str) -> bool:
     return any(m in body for m in _POST_GRAPHQL_MARKERS)
+
+
+def _load_known_shortcodes_from_posts_json(path: Path) -> set[str]:
+    """Shortcodes from a prior posts.json scrape; empty set if missing or invalid."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    posts = data.get("posts")
+    if not isinstance(posts, list):
+        return set()
+    out: set[str] = set()
+    for p in posts:
+        if not isinstance(p, dict):
+            continue
+        sc = p.get("shortcode")
+        if isinstance(sc, str) and sc:
+            out.add(sc)
+    return out
 
 
 def _extract_timeline_nodes(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -279,6 +305,7 @@ def _collect_cdn_urls(obj: object, out: set[str]) -> None:
 
 def _make_graphql_posts_capture(
     save_dir: Path,
+    shortcodes_out: set[str],
 ) -> tuple[Callable[[Response], None], Callable[[], tuple[list[str], int]]]:
     """Capture GraphQL responses that carry post/media data; return (handler, finalize)."""
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -313,6 +340,10 @@ def _make_graphql_posts_capture(
         try:
             data = json.loads(raw)
             _collect_cdn_urls(data, all_urls)
+            for node in _extract_timeline_nodes(data):
+                code = node.get("code")
+                if isinstance(code, str) and code:
+                    shortcodes_out.add(code)
         except json.JSONDecodeError:
             pass
 
@@ -357,8 +388,12 @@ def _open_following_profile(page, username: str) -> None:
     raw_dir = TEMP_DOWNLOAD_RAW / u
     clean_dir = TEMP_DOWNLOAD / u
     clean_dir.mkdir(parents=True, exist_ok=True)
-    gql_handler, finalize = _make_graphql_posts_capture(raw_dir)
+    known_shortcodes = _load_known_shortcodes_from_posts_json(clean_dir / "posts.json")
+    shortcodes_this_run: set[str] = set()
+    gql_handler, finalize = _make_graphql_posts_capture(raw_dir, shortcodes_this_run)
     page.on("response", gql_handler)
+    scroll_stopped_early = False
+    overlap_at_stop = 0
     try:
         dialog = page.locator('[role="dialog"]').first
         dialog.wait_for(state="visible", timeout=15_000)
@@ -374,7 +409,12 @@ def _open_following_profile(page, username: str) -> None:
                 row_link.evaluate("el => el.click()")
         page.wait_for_url(lambda url: f"/{u}/" in url, timeout=25_000)
         page.wait_for_timeout(1500)
-        _scroll_profile_down(page, times=10)
+        for _ in range(MAX_PROFILE_SCROLLS):
+            _scroll_profile_down_once(page)
+            overlap_at_stop = len(known_shortcodes & shortcodes_this_run)
+            if overlap_at_stop > OVERLAP_STOP_THRESHOLD:
+                scroll_stopped_early = True
+                break
     finally:
         page.remove_listener("response", gql_handler)
 
@@ -390,10 +430,16 @@ def _open_following_profile(page, username: str) -> None:
         encoding="utf-8",
     )
     n_flat = len(organized_all["largest"]) + len(organized_all["other"])
+    exit_note = (
+        f", early_exit overlap={overlap_at_stop}"
+        if scroll_stopped_early
+        else f", scrolls={MAX_PROFILE_SCROLLS} (no early exit)"
+    )
     print(
         f"  {u}: raw posts_graphql × {n_saved} → {raw_dir.relative_to(PROJECT_ROOT)}, "
         f"posts.json × {len(bundle['posts'])}, openable_media_urls × {n_flat} "
         f"({len(organized_all['largest'])} largest / {len(organized_all['other'])} other)"
+        f"{exit_note}"
     )
 
 
@@ -436,14 +482,19 @@ async () => {
 """
 
 
+def _scroll_profile_down_once(page) -> None:
+    """One human-like scroll: 70–100% of viewport, slow→fast→slow easing."""
+    result = page.evaluate(_ONE_HUMAN_SCROLL_JS)
+    if isinstance(result, dict) and result.get("atBottom"):
+        page.wait_for_timeout(random.randint(500, 1_400))
+        return
+    page.wait_for_timeout(random.randint(900, 2_800))
+
+
 def _scroll_profile_down(page, times: int) -> None:
     """Each scroll: 70–100% of viewport (not tiny chunks), one motion with slow→fast→slow easing."""
     for _ in range(times):
-        result = page.evaluate(_ONE_HUMAN_SCROLL_JS)
-        if isinstance(result, dict) and result.get("atBottom"):
-            page.wait_for_timeout(random.randint(500, 1_400))
-            continue
-        page.wait_for_timeout(random.randint(900, 2_800))
+        _scroll_profile_down_once(page)
 
 
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
