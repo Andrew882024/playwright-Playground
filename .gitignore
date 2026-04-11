@@ -5,3 +5,4 @@ temp_download/
 temp_download_raw/
 __pycache__/
 *.pyc
+app/ai_analyze_service/__pycache__/ai_analyze.cpython-312.pyc
