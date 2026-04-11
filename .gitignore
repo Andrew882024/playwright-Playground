@@ -3,3 +3,5 @@ venv/
 .env
 temp_download/
 temp_download_raw/
+__pycache__/
+*.pyc

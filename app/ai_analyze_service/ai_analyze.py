@@ -4,6 +4,8 @@ Classify Instagram posts (event vs not) and extract structured fields via Google
 Environment (set in .env in project root, or .env.gemini):
   GEMINI_API_KEY or GOOGLE_API_KEY — required for the Gemini API.
   GEMINI_MODEL — optional; default gemini-2.5-flash (stable; 2.0 Flash is deprecated).
+  GEMINI_MODEL_FALLBACK — optional comma-separated model ids tried after GEMINI_MODEL when
+    429/free-tier quota is exhausted (default: see DEFAULT_MODEL_FALLBACK_CHAIN in code).
   GEMINI_DEFAULT_TZ — optional IANA zone for interpreting relative dates (default America/Los_Angeles).
 
 .env format: simple KEY=value lines (optional "export " prefix, # comments). A large
@@ -14,6 +16,13 @@ Usage:
   python -m app.ai_analyze_service.ai_analyze
   python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --limit 3
   python -m app.ai_analyze_service.ai_analyze --resume  # skip posts that already have ai in posts_ai.json
+
+Model fallback chain (rate/quota):
+  We start with GEMINI_MODEL. Each model gets up to several HTTP 429 retries; when that model’s
+  retry budget is exhausted, we pass down to the next id in the chain (GEMINI_MODEL_FALLBACK or
+  DEFAULT_MODEL_FALLBACK_CHAIN), in order, until one succeeds or every model is exhausted — then we
+  stop with "We ran out of all models." Invalid-JSON repair attempts stay on the same model and do
+  not advance the chain.
 """
 
 from __future__ import annotations
@@ -76,8 +85,22 @@ def _load_env() -> None:
 
 _load_env()
 
-# Stable model id; see https://ai.google.dev/gemini-api/docs/models
+# Stable model ids; see https://ai.google.dev/gemini-api/docs/models
+# Order: primary (GEMINI_MODEL) then these, deduped. All are commonly available on the free tier;
+# exact quotas vary by model and region—check AI Studio rate limits.
 DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL_FALLBACK_CHAIN: tuple[str, ...] = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+)
+
+# Raised when every model in the chain hits rate/quota or free-tier exhaustion.
+ALL_MODELS_EXHAUSTED_MSG = "We ran out of all models."
 DEFAULT_TZ = "America/Los_Angeles"
 MAX_IMAGES = 6
 USER_AGENT = (
@@ -138,6 +161,8 @@ class PostAnalysisAI(BaseModel):
     event_description: Optional[str] = None
     confidence: Optional[Literal["low", "medium", "high"]] = None
     raw_notes: Optional[str] = None
+    # Set by the analyzer after a successful API call (not returned by Gemini JSON).
+    gemini_model: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_branch(self) -> PostAnalysisAI:
@@ -169,6 +194,25 @@ def _gemini_model() -> str:
     import os
 
     return (os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+
+
+def _gemini_model_chain() -> list[str]:
+    """Primary model first, then fallbacks (deduped). After each model exhausts 429 retries, we try the next."""
+    import os
+
+    primary = _gemini_model()
+    extra = (os.environ.get("GEMINI_MODEL_FALLBACK") or "").strip()
+    if extra:
+        rest = [p.strip() for p in extra.split(",") if p.strip()]
+    else:
+        rest = list(DEFAULT_MODEL_FALLBACK_CHAIN)
+    seen: set[str] = {primary}
+    out = [primary]
+    for m in rest:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 
 def _default_tz() -> ZoneInfo:
@@ -325,13 +369,13 @@ def _client_error_blob(e: ClientError) -> str:
 
 
 def _retry_delay_from_client_error(e: ClientError) -> float:
-    for hay in (e.message or "", _client_error_blob(e)):
-        m = _RETRY_AFTER_RE.search(hay)
-        if m:
-            try:
-                return min(120.0, max(1.0, float(m.group(1))))
-            except ValueError:
-                break
+    # for hay in (e.message or "", _client_error_blob(e)):
+    #     m = _RETRY_AFTER_RE.search(hay)
+    #     if m:
+    #         try:
+    #             return min(120.0, max(1.0, float(m.group(1))))
+    #         except ValueError:
+    #             break
     return 5.0
 
 
@@ -341,7 +385,7 @@ def _generate_content_with_429_retry(
     contents: list[Any],
     config: types.GenerateContentConfig,
     *,
-    max_quota_retries: int = 8,
+    max_quota_retries: int = 5,
 ) -> Any:
     for attempt in range(max_quota_retries):
         try:
@@ -362,22 +406,27 @@ def _generate_content_with_429_retry(
                 ) from e
             if attempt == max_quota_retries - 1:
                 print(
-                    f"Gemini API: 429 after {max_quota_retries} attempts (rate limit / quota). Giving up.",
+                    f"Gemini API: model {model!r}: 429 after {max_quota_retries} attempts "
+                    f"(rate limit / quota). Giving up on this model.",
                     file=sys.stderr,
                 )
                 raise
             delay = _retry_delay_from_client_error(e)
             print(
-                f"Gemini API: 429 (rate limit / quota). Waiting {delay:.1f}s, then retry "
-                f"{attempt + 2}/{max_quota_retries}...",
+                f"Gemini API: model {model!r}: 429 (rate limit / quota). "
+                f"Waiting {delay:.1f}s, then retry {attempt + 2}/{max_quota_retries} on this model...",
                 file=sys.stderr,
             )
             time.sleep(delay)
 
 
 def _format_analysis_error(e: BaseException) -> str:
-    if isinstance(e, RuntimeError) and str(e).startswith("Gemini API:"):
-        return str(e).split("\n")[0][:500]
+    if isinstance(e, RuntimeError):
+        s = str(e)
+        if s == ALL_MODELS_EXHAUSTED_MSG:
+            return s
+        if s.startswith("Gemini API:"):
+            return s.split("\n")[0][:500]
     if isinstance(e, ClientError):
         msg = (e.message or "").strip()
         if e.code == 429:
@@ -401,6 +450,7 @@ def _format_ai_terminal_summary(shortcode: str, ai: PostAnalysisAI) -> str:
     """Human-readable one-line summary of a successful analysis (stdout)."""
     conf = ai.confidence or "?"
     sc = shortcode if shortcode else "?"
+    mod = ai.gemini_model or "?"
     if ai.is_event:
         parts = [
             f'title="{_clip_one_line(ai.event_title or "", 72)}"',
@@ -412,17 +462,23 @@ def _format_ai_terminal_summary(shortcode: str, ai: PostAnalysisAI) -> str:
             y, m, d = ai.start.year, ai.start.month, ai.start.day
             parts.append(f"start={y:04d}-{m:02d}-{d:02d}")
         body = " | ".join(parts)
-        return f"  AI [{sc}] {conf}: event — {body}"
+        return f"  AI [{sc}] model={mod} {conf}: event — {body}"
     desc = _clip_one_line(ai.description or "", 110)
-    return f"  AI [{sc}] {conf}: not an event — {desc}"
+    return f"  AI [{sc}] model={mod} {conf}: not an event — {desc}"
 
 
 def _analyze_post(
     client: genai.Client,
-    model: str,
+    model_chain: list[str],
     post: dict[str, Any],
     tz: ZoneInfo,
-) -> PostAnalysisAI:
+    *,
+    start_idx: int = 0,
+) -> tuple[PostAnalysisAI, int]:
+    """Walk model_chain from start_idx: per model, 429 retries then pass down; last failure → ALL_MODELS_EXHAUSTED.
+
+    Returns (analysis, index_in_chain_of_model_used).
+    """
     ref = _taken_at_reference_line(post.get("taken_at"), tz)
     urls = _image_urls_from_post(post)
     image_parts: list[types.Part] = []
@@ -447,46 +503,93 @@ def _analyze_post(
     sc = post.get("shortcode")
     label = sc if isinstance(sc, str) else "?"
 
-    for attempt in range(3):
-        fix = (
-            ""
-            if attempt == 0
-            else "\n\nYour previous output was invalid. Output only valid JSON matching the schema."
-        )
-        contents: list[Any] = [*image_parts, base_prompt + fix]
-        try:
-            resp = _generate_content_with_429_retry(
-                client,
-                model,
-                contents,
-                config,
+    n_chain = len(model_chain)
+    if n_chain == 0:
+        raise RuntimeError("Gemini model chain is empty.")
+    idx0 = max(0, min(start_idx, n_chain - 1))
+
+    for model_idx, model in enumerate(model_chain[idx0:], start=idx0):
+        quota_try_next = False
+        for attempt in range(3):
+            fix = (
+                ""
+                if attempt == 0
+                else "\n\nYour previous output was invalid. Output only valid JSON matching the schema."
             )
-            raw = (resp.text or "").strip()
-            data = _parse_json_text(raw)
-            ai = PostAnalysisAI.model_validate(data)
-            notes = (ai.raw_notes or "").strip()
-            if fetch_notes:
-                extra = "Images: " + "; ".join(fetch_notes)
-                ai = ai.model_copy(
-                    update={"raw_notes": f"{notes}\n{extra}".strip() if notes else extra}
+            contents = [*image_parts, base_prompt + fix]
+            try:
+                resp = _generate_content_with_429_retry(
+                    client,
+                    model,
+                    contents,
+                    config,
                 )
-            return ai
-        except (json.JSONDecodeError, ValueError, ValidationError) as e:
-            last_err = e
-            err_one = _format_analysis_error(e)
-            if attempt < 2:
+                raw = (resp.text or "").strip()
+                data = _parse_json_text(raw)
+                ai = PostAnalysisAI.model_validate(data)
+                notes = (ai.raw_notes or "").strip()
+                upd: dict[str, Any] = {"gemini_model": model}
+                if fetch_notes:
+                    extra = "Images: " + "; ".join(fetch_notes)
+                    upd["raw_notes"] = f"{notes}\n{extra}".strip() if notes else extra
+                ai = ai.model_copy(update=upd)
+                return ai, model_idx
+            except ClientError as e:
+                if e.code != 429:
+                    raise
+                if model_idx < len(model_chain) - 1:
+                    nxt = model_chain[model_idx + 1]
+                    print(
+                        f"Gemini [{label}]: Rate/quota retries exhausted for model {model!r}. "
+                        f"Passing down the fallback chain → {nxt!r} ({model_idx + 2}/{len(model_chain)}).",
+                        file=sys.stderr,
+                    )
+                    quota_try_next = True
+                    break
                 print(
-                    f"Gemini [{label}]: invalid JSON or schema ({type(e).__name__}: {err_one}). "
-                    f"Retrying with reminder ({attempt + 2}/3)...",
+                    f"Gemini [{label}]: Rate/quota retries exhausted for model {model!r}; "
+                    f"end of fallback chain ({len(model_chain)} models). {ALL_MODELS_EXHAUSTED_MSG}",
                     file=sys.stderr,
                 )
-            else:
-                print(
-                    f"Gemini [{label}]: invalid JSON or schema on last try ({type(e).__name__}: {err_one}).",
-                    file=sys.stderr,
-                )
-            time.sleep(0.5 * (attempt + 1))
-    raise RuntimeError(f"Gemini JSON validation failed after retries: {last_err}") from last_err
+                raise RuntimeError(ALL_MODELS_EXHAUSTED_MSG) from e
+            except RuntimeError as e:
+                msg = str(e)
+                if "free-tier quota exhausted" in msg:
+                    if model_idx < len(model_chain) - 1:
+                        nxt = model_chain[model_idx + 1]
+                        print(
+                            f"Gemini [{label}]: Free-tier quota exhausted for model {model!r}. "
+                            f"Passing down the fallback chain → {nxt!r} ({model_idx + 2}/{len(model_chain)}).",
+                            file=sys.stderr,
+                        )
+                        quota_try_next = True
+                        break
+                    print(
+                        f"Gemini [{label}]: Free-tier quota exhausted for model {model!r}; "
+                        f"end of fallback chain ({len(model_chain)} models). {ALL_MODELS_EXHAUSTED_MSG}",
+                        file=sys.stderr,
+                    )
+                    raise RuntimeError(ALL_MODELS_EXHAUSTED_MSG) from e
+                raise
+            except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                last_err = e
+                err_one = _format_analysis_error(e)
+                if attempt < 2:
+                    print(
+                        f"Gemini [{label}] model={model!r}: invalid JSON or schema ({type(e).__name__}: {err_one}). "
+                        f"Retrying on this model with reminder ({attempt + 2}/3)...",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Gemini [{label}] model={model!r}: invalid JSON or schema on last try "
+                        f"({type(e).__name__}: {err_one}).",
+                        file=sys.stderr,
+                    )
+                time.sleep(0.5 * (attempt + 1))
+        if quota_try_next:
+            continue
+        raise RuntimeError(f"Gemini JSON validation failed after retries: {last_err}") from last_err
 
 
 def _discover_profiles(base: Path) -> list[Path]:
@@ -518,23 +621,25 @@ def process_profile_dir(
     clean_dir: Path,
     *,
     client: genai.Client,
-    model: str,
+    model_chain: list[str],
     tz: ZoneInfo,
     limit: int | None,
     resume: bool,
     sleep_s: float,
-) -> None:
+    chain_start_idx: int = 0,
+) -> int:
     posts_path = clean_dir / "posts.json"
     out_path = clean_dir / "posts_ai.json"
     bundle = json.loads(posts_path.read_text(encoding="utf-8"))
     posts = bundle.get("posts")
     if not isinstance(posts, list):
         print(f"Skip {clean_dir.name}: invalid posts.json", file=sys.stderr)
-        return
+        return chain_start_idx
 
     existing_ai = _load_existing_ai_by_shortcode(out_path) if resume else {}
     analyzed = 0
     out_posts: list[dict[str, Any]] = []
+    chain_offset = chain_start_idx
 
     for post in posts:
         if not isinstance(post, dict):
@@ -549,7 +654,10 @@ def process_profile_dir(
             out_posts.append(dict(post))
             continue
         try:
-            ai = _analyze_post(client, model, post, tz)
+            ai, used_idx = _analyze_post(
+                client, model_chain, post, tz, start_idx=chain_offset
+            )
+            chain_offset = used_idx
             row = dict(post)
             row["ai"] = ai.model_dump(mode="json", exclude_none=False)
             out_posts.append(row)
@@ -582,6 +690,7 @@ def process_profile_dir(
         encoding="utf-8",
     )
     print(f"Wrote {out_path.relative_to(PROJECT_ROOT)} ({len(out_posts)} posts, analyzed {analyzed})")
+    return chain_offset
 
 
 def main() -> None:
@@ -604,15 +713,20 @@ def main() -> None:
     parser.add_argument(
         "--sleep",
         type=float,
-        default=1.0,
-        help="Seconds to sleep between Gemini calls (default 1.0)",
+        default=3.0,
+        help="Seconds to sleep between Gemini calls (default 3.0)",
     )
     args = parser.parse_args()
 
     key = _gemini_api_key()
-    model = _gemini_model()
+    model_chain = _gemini_model_chain()
     tz = _default_tz()
     client = genai.Client(api_key=key)
+
+    print(
+        f"Gemini model chain ({len(model_chain)}): {' → '.join(model_chain)}",
+        file=sys.stderr,
+    )
 
     if args.profile:
         dirs = [TEMP_DOWNLOAD / args.profile.strip().lstrip("@")]
@@ -626,16 +740,18 @@ def main() -> None:
         print(f"No profiles with posts.json under {TEMP_DOWNLOAD}", file=sys.stderr)
         sys.exit(1)
 
+    chain_offset = 0
     for d in dirs:
         print(f"Profile: {d.name}")
-        process_profile_dir(
+        chain_offset = process_profile_dir(
             d,
             client=client,
-            model=model,
+            model_chain=model_chain,
             tz=tz,
             limit=args.limit,
             resume=args.resume,
             sleep_s=args.sleep,
+            chain_start_idx=chain_offset,
         )
 
 
