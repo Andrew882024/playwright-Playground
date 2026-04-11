@@ -11,9 +11,9 @@ python-dotenv-incompatible .env is parsed line-by-line here so you do not get hu
 of parse warnings. Put Gemini keys in .env.gemini if you prefer a tiny file.
 
 Usage:
-  python -m app.ai_analyze
-  python -m app.ai_analyze --profile seventhcollegestudentcouncil --limit 3
-  python -m app.ai_analyze --resume  # skip posts that already have ai in posts_ai.json
+  python -m app.ai_analyze_service.ai_analyze
+  python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --limit 3
+  python -m app.ai_analyze_service.ai_analyze --resume  # skip posts that already have ai in posts_ai.json
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ from google.genai import types
 from google.genai.errors import ClientError
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-# Repo root (…/playwright-Playground)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Repo root (…/playwright-Playground); file is app/ai_analyze_service/ai_analyze.py
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 
 
@@ -361,8 +361,18 @@ def _generate_content_with_429_retry(
                     "See https://ai.google.dev/gemini-api/docs/rate-limits"
                 ) from e
             if attempt == max_quota_retries - 1:
+                print(
+                    f"Gemini API: 429 after {max_quota_retries} attempts (rate limit / quota). Giving up.",
+                    file=sys.stderr,
+                )
                 raise
-            time.sleep(_retry_delay_from_client_error(e))
+            delay = _retry_delay_from_client_error(e)
+            print(
+                f"Gemini API: 429 (rate limit / quota). Waiting {delay:.1f}s, then retry "
+                f"{attempt + 2}/{max_quota_retries}...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def _format_analysis_error(e: BaseException) -> str:
@@ -434,6 +444,9 @@ def _analyze_post(
     )
 
     last_err: Exception | None = None
+    sc = post.get("shortcode")
+    label = sc if isinstance(sc, str) else "?"
+
     for attempt in range(3):
         fix = (
             ""
@@ -460,6 +473,18 @@ def _analyze_post(
             return ai
         except (json.JSONDecodeError, ValueError, ValidationError) as e:
             last_err = e
+            err_one = _format_analysis_error(e)
+            if attempt < 2:
+                print(
+                    f"Gemini [{label}]: invalid JSON or schema ({type(e).__name__}: {err_one}). "
+                    f"Retrying with reminder ({attempt + 2}/3)...",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Gemini [{label}]: invalid JSON or schema on last try ({type(e).__name__}: {err_one}).",
+                    file=sys.stderr,
+                )
             time.sleep(0.5 * (attempt + 1))
     raise RuntimeError(f"Gemini JSON validation failed after retries: {last_err}") from last_err
 

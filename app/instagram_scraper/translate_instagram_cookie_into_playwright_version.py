@@ -12,8 +12,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Repo root when this file lives in app/ (…/playwright-Playground/app/this_file.py)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Repo root: …/playwright-Playground/ (this file is app/instagram_scraper/…)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _load_firefox_cookie_json(raw: str) -> list[dict]:
