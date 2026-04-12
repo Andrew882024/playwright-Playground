@@ -4,8 +4,8 @@ Open Instagram in Playwright using cookies from .env (see translate_instagram_co
 Visits each account in tempdata.py via the Following modal, scrolls the profile, and records:
 
 - Raw GraphQL bodies: temp_download_raw/<user>/posts_graphql_*.json
-- Clean scrape bundle: temp_download/<user>/posts.json (title, caption, comments[], taken_at,
-  posting_time_utc, author, links) plus openable_media_urls.json. Each post's openable_media_urls is
+- Clean scrape bundle: temp_download/<user>/posts.json (title, comments[] with kind caption|reply,
+  taken_at, posting_time_utc, author, links) plus openable_media_urls.json. Each post's openable_media_urls is
   {"largest": [...], "other": [...]} — one best-resolution URL per asset, then remaining variants.
 
 Profile-scroll GraphQL often includes only a preview of comments; comment_count_total and
@@ -54,6 +54,9 @@ TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 # Early-exit profile scroll: stop when len(known ∩ this_run) > OVERLAP_STOP_THRESHOLD (e.g. 3+ matches).
 OVERLAP_STOP_THRESHOLD = 2
 MAX_PROFILE_SCROLLS = 10
+
+# Following modal: scroll down to search for a username row; max scrolls before skipping that target.
+MAX_FOLLOWING_MODAL_SCROLLS = 20
 
 # Substrings that suggest this GraphQL JSON carries posts / media / comments (not inbox tray, etc.).
 _POST_GRAPHQL_MARKERS = (
@@ -188,7 +191,7 @@ def _comment_count_from_node(node: dict[str, Any]) -> int | None:
     return None
 
 
-def _comment_record_from_graphql_node(n: dict[str, Any]) -> dict[str, Any] | None:
+def _comment_record_from_graphql_node(n: dict[str, Any]) -> dict[str, Any]:
     text = n.get("text")
     if not isinstance(text, str):
         text = ""
@@ -201,11 +204,77 @@ def _comment_record_from_graphql_node(n: dict[str, Any]) -> dict[str, Any] | Non
     cid = n.get("id")
     created = n.get("created_at")
     return {
+        "kind": "reply",
         "id": str(cid) if cid is not None else None,
         "text": text,
         "username": username,
         "created_at": created,
     }
+
+
+def _caption_comment_entry(username: str | None, text: str | None) -> dict[str, Any]:
+    u = (username or "").strip() if isinstance(username, str) else ""
+    t = text if isinstance(text, str) else ""
+    return {"kind": "caption", "text": t, "username": u}
+
+
+def _comments_unified_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
+    author = _from_username(node)
+    cap = _post_caption_text(node)
+    caption_entry = _caption_comment_entry(author, cap)
+    raw = _raw_comment_nodes_from_media(node)
+    reply_list: list[dict[str, Any]] = []
+    for n in raw:
+        reply_list.append(_comment_record_from_graphql_node(n))
+    merged_replies = _merge_comment_lists(reply_list, [])
+    return [caption_entry] + merged_replies
+
+
+def _merge_caption_entries(
+    a: dict[str, Any] | None,
+    b: dict[str, Any] | None,
+    fallback_username: str | None,
+) -> dict[str, Any]:
+    if not a and not b:
+        return _caption_comment_entry(fallback_username, None)
+    if not b:
+        return a  # type: ignore[return-value]
+    if not a:
+        return b  # type: ignore[return-value]
+    ta = (a.get("text") or "").strip()
+    tb = (b.get("text") or "").strip()
+    if ta and not tb:
+        return a
+    if tb and not ta:
+        return b
+    if ta and tb:
+        return a if len(ta) >= len(tb) else b
+    ua = (a.get("username") or "").strip() or (fallback_username or "")
+    return _caption_comment_entry(ua or None, ta or tb or None)
+
+
+def _merge_unified_comment_lists(
+    prev_list: object,
+    rec_list: object,
+    *,
+    fallback_username: str | None,
+) -> list[dict[str, Any]]:
+    pl = prev_list if isinstance(prev_list, list) else []
+    rl = rec_list if isinstance(rec_list, list) else []
+    pc = next((x for x in pl if isinstance(x, dict) and x.get("kind") == "caption"), None)
+    rc = next((x for x in rl if isinstance(x, dict) and x.get("kind") == "caption"), None)
+    merged_cap = _merge_caption_entries(
+        pc if isinstance(pc, dict) else None,
+        rc if isinstance(rc, dict) else None,
+        fallback_username,
+    )
+    pr = [x for x in pl if isinstance(x, dict) and x.get("kind") != "caption"]
+    rr = [x for x in rl if isinstance(x, dict) and x.get("kind") != "caption"]
+    merged_replies = _merge_comment_lists(pr, rr)
+    for r in merged_replies:
+        if isinstance(r, dict):
+            r["kind"] = "reply"
+    return [merged_cap] + merged_replies
 
 
 def _raw_comment_nodes_from_media(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -264,14 +333,6 @@ def _merge_comment_lists(a: object, b: object) -> list[dict[str, Any]]:
         return (ti, str(x.get("username") or ""))
 
     return sorted(by_key.values(), key=_sort_key)
-
-
-def _comments_structured_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = _raw_comment_nodes_from_media(node)
-    normalized: list[dict[str, Any]] = []
-    for n in raw:
-        normalized.append(_comment_record_from_graphql_node(n))
-    return _merge_comment_lists(normalized, [])
 
 
 def _merge_optional_comment_count(a: object, b: object) -> int | None:
@@ -366,15 +427,12 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     if not isinstance(code, str) or not code:
         return
     urls = set(_openable_urls_for_subtree(node))
-    cap = _post_caption_text(node)
     rec = {
         "shortcode": code,
         "permalink": f"{INSTAGRAM_ORIGIN}/p/{code}/",
         "from_username": _from_username(node),
         "title": _post_title(node),
-        "caption": cap,
-        "comment": cap,
-        "comments": _comments_structured_from_node(node),
+        "comments": _comments_unified_from_node(node),
         "comment_count_total": _comment_count_from_node(node),
         "openable_media_urls": urls,
         "taken_at": _post_timestamp_unix(node),
@@ -386,12 +444,6 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     prev = by_shortcode[code]
     merged = _coerce_url_set(prev["openable_media_urls"]) | urls
     prev["openable_media_urls"] = merged
-    if prev.get("caption") is None and rec.get("caption") is not None:
-        prev["caption"] = rec["caption"]
-        prev["comment"] = rec["comment"]
-    elif prev.get("comment") is None and rec.get("comment") is not None:
-        prev["comment"] = rec["comment"]
-        prev["caption"] = rec["caption"]
     if prev.get("title") is None and rec.get("title") is not None:
         prev["title"] = rec["title"]
     if prev.get("from_username") is None and rec.get("from_username") is not None:
@@ -401,7 +453,13 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     mct = _merge_optional_comment_count(prev.get("comment_count_total"), rec.get("comment_count_total"))
     if mct is not None:
         prev["comment_count_total"] = mct
-    prev["comments"] = _merge_comment_lists(prev.get("comments"), rec.get("comments"))
+    author = prev.get("from_username") or rec.get("from_username")
+    author_s = author if isinstance(author, str) else None
+    prev["comments"] = _merge_unified_comment_lists(
+        prev.get("comments"),
+        rec.get("comments"),
+        fallback_username=author_s,
+    )
 
 
 def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict[str, Any]:
@@ -430,10 +488,28 @@ def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict
             p["posting_time_utc"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
         else:
             p.pop("posting_time_utc", None)
-        total = p.get("comment_count_total")
         clist = p.get("comments")
-        n_comments = len(clist) if isinstance(clist, list) else 0
-        if isinstance(total, int) and n_comments < total:
+        if not isinstance(clist, list):
+            clist = []
+        has_caption_kind = any(
+            isinstance(x, dict) and x.get("kind") == "caption" for x in clist
+        )
+        leg_cap = p.get("caption") or p.get("comment")
+        leg_s = leg_cap.strip() if isinstance(leg_cap, str) else ""
+        if leg_s and not has_caption_kind:
+            auth = (p.get("from_username") or "").strip()
+            clist = [_caption_comment_entry(auth or None, leg_s)] + clist
+        for x in clist:
+            if isinstance(x, dict) and "kind" not in x:
+                x["kind"] = "reply"
+        p["comments"] = clist
+        p.pop("caption", None)
+        p.pop("comment", None)
+        total = p.get("comment_count_total")
+        n_replies = sum(
+            1 for x in clist if isinstance(x, dict) and x.get("kind") != "caption"
+        )
+        if isinstance(total, int) and n_replies < total:
             p["comments_incomplete"] = True
         else:
             p.pop("comments_incomplete", None)
@@ -522,22 +598,110 @@ def _open_profile(page, username: str) -> None:
     page.wait_for_timeout(1500)
 
 
-def _open_following_list(page) -> None:
-    """On profile page, click Following (stats row or /username/following/ link) and wait for the modal if shown."""
+def _open_following_list(page, profile_username: str) -> None:
+    """Open the Following list modal from the given account's profile page.
+
+    After visiting another profile, the browser may not be on ``profile_username``'s page, so we
+    always navigate to ``/{profile_username}/`` first, then click Following (several fallbacks).
+    """
+    u = profile_username.lstrip("@").strip()
+    profile_home = f"{INSTAGRAM_ORIGIN}/{u}/"
+    page.goto(profile_home, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_timeout(1500)
+    _dismiss_instagram_notification_prompt_if_present(page)
+
+    opened = False
     try:
-        page.locator('a[href*="/following"]').first.click(timeout=12_000)
+        page.locator(f'a[href="/{u}/following/"]').first.click(timeout=12_000)
+        opened = True
     except Exception:
+        pass
+    if not opened:
+        try:
+            page.locator('a[href*="/following"]').first.click(timeout=12_000)
+            opened = True
+        except Exception:
+            pass
+    if not opened:
         try:
             page.get_by_role("link", name=re.compile(r"following", re.I)).first.click(timeout=12_000)
+            opened = True
         except Exception:
-            page.locator("span").filter(has_text=re.compile(r"^\s*following\s*$", re.I)).first.click(
-                timeout=8_000
-            )
+            pass
+    if not opened:
+        try:
+            page.locator("span").filter(has_text=re.compile(r"following", re.I)).first.click(timeout=10_000)
+            opened = True
+        except Exception:
+            pass
+    if not opened:
+        try:
+            page.get_by_text(re.compile(r"^\s*following\s*$", re.I)).first.click(timeout=8_000)
+            opened = True
+        except Exception:
+            pass
+    if not opened:
+        raise RuntimeError(
+            f"Could not open Following list from profile {u!r}. "
+            "Check that the stats row is visible or the UI changed."
+        )
+
     page.wait_for_timeout(1500)
     try:
         page.locator('[role="dialog"]').first.wait_for(state="visible", timeout=10_000)
     except Exception:
         pass
+
+
+def _scroll_following_modal_once(page, dialog) -> None:
+    """Scroll the Following list inside the dialog (not the main window)."""
+    dialog.evaluate(
+        """(root) => {
+          function findScrollable(el, depth) {
+            if (!el || depth > 16) return null;
+            const st = window.getComputedStyle(el);
+            const oy = st.overflowY;
+            if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 24) {
+              return el;
+            }
+            for (let i = 0; i < el.children.length; i++) {
+              const f = findScrollable(el.children[i], depth + 1);
+              if (f) return f;
+            }
+            return null;
+          }
+          const sc = findScrollable(root, 0) || root;
+          const ch = sc.clientHeight || 400;
+          sc.scrollTop += Math.max(200, Math.floor(ch * 0.78));
+        }"""
+    )
+    page.wait_for_timeout(random.randint(350, 700))
+
+
+def _try_click_following_row_in_modal(page, dialog, username: str) -> bool:
+    """Find `a[href="/user/"]` in the Following modal, scrolling up to MAX_FOLLOWING_MODAL_SCROLLS times."""
+    u = username.lstrip("@").strip()
+    sel = f'a[href="/{u}/"]'
+    for attempt in range(MAX_FOLLOWING_MODAL_SCROLLS + 1):
+        rows = dialog.locator(sel)
+        try:
+            if rows.count() > 0:
+                row_link = rows.first
+                row_link.scroll_into_view_if_needed(timeout=10_000)
+                try:
+                    row_link.click(timeout=12_000)
+                except Exception:
+                    try:
+                        row_link.click(timeout=12_000, force=True)
+                    except Exception:
+                        row_link.evaluate("el => el.click()")
+                return True
+        except Exception:
+            pass
+        if attempt < MAX_FOLLOWING_MODAL_SCROLLS:
+            _scroll_following_modal_once(page, dialog)
+    return False
+
 
 def _open_following_profile(page, username: str) -> None:
     """Click the account row inside the open Following modal (not a global .first link — sidebar can be disabled)."""
@@ -554,16 +718,13 @@ def _open_following_profile(page, username: str) -> None:
     try:
         dialog = page.locator('[role="dialog"]').first
         dialog.wait_for(state="visible", timeout=15_000)
-        # Only links inside the modal; page-wide `a[href="..."] .first` hits background UI (disabled under overlay).
-        row_link = dialog.locator(f'a[href="/{u}/"]').first
-        row_link.scroll_into_view_if_needed(timeout=10_000)
-        try:
-            row_link.click(timeout=12_000)
-        except Exception:
-            try:
-                row_link.click(timeout=12_000, force=True)
-            except Exception:
-                row_link.evaluate("el => el.click()")
+        # Only links inside the modal; scroll the list if the row is below the fold.
+        if not _try_click_following_row_in_modal(page, dialog, u):
+            print(
+                f"  {u}: not found in Following list after {MAX_FOLLOWING_MODAL_SCROLLS} scrolls, skipping.",
+                file=sys.stderr,
+            )
+            return
         page.wait_for_url(lambda url: f"/{u}/" in url, timeout=25_000)
         page.wait_for_timeout(1500)
         for _ in range(MAX_PROFILE_SCROLLS):
@@ -691,7 +852,7 @@ def main() -> None:
         if profile_user:
             _open_profile(page, profile_user)
             for username in following_usernames:
-                _open_following_list(page)
+                _open_following_list(page, profile_user)
                 _open_following_profile(page, username)
                 try:
                     page.go_back(wait_until="domcontentloaded", timeout=25_000)

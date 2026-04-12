@@ -119,7 +119,7 @@ Event vs not:
   schedulable occurrence.
 
 Rules:
-- Use the post's title, caption, optional thread comments, and any attached images (flyers).
+- Use the post's title, comments array (caption + thread replies), and any attached images (flyers).
 - Resolve relative dates ("this Saturday", "tomorrow") using the reference datetime provided.
 - If you cannot resolve year/month/day or time from the text, use null for those fields and
   explain in raw_notes. Do not invent a year.
@@ -307,9 +307,19 @@ def _taken_at_reference_line(taken_at: Any, tz: ZoneInfo) -> str:
     )
 
 
+def _caption_text_from_post(post: dict[str, Any]) -> str:
+    raw = post.get("comments")
+    if isinstance(raw, list):
+        for c in raw:
+            if isinstance(c, dict) and c.get("kind") == "caption":
+                return (c.get("text") or "").strip()
+    leg = post.get("caption") or post.get("comment")
+    return (leg.strip() if isinstance(leg, str) else "") or ""
+
+
 def _user_prompt(post: dict[str, Any], ref_line: str, num_images: int) -> str:
     title = post.get("title") or ""
-    caption = (post.get("caption") or post.get("comment") or "").strip()
+    caption = _caption_text_from_post(post)
     user = post.get("from_username") or ""
     link = post.get("permalink") or ""
     shortcode = post.get("shortcode") or ""
@@ -317,18 +327,34 @@ def _user_prompt(post: dict[str, Any], ref_line: str, num_images: int) -> str:
     raw_comments = post.get("comments")
     if isinstance(raw_comments, list) and raw_comments:
         lines: list[str] = []
-        for i, c in enumerate(raw_comments, start=1):
+        n = 0
+        for c in raw_comments:
             if not isinstance(c, dict):
                 continue
-            who = (c.get("username") or "?").strip()
-            body = (c.get("text") or "").strip()
-            lines.append(f"{i}. @{who}: {body}")
+            kind = c.get("kind")
+            if kind == "caption":
+                who = (c.get("username") or user or "?").strip()
+                body = (c.get("text") or "").strip()
+                n += 1
+                lines.append(f"{n}. [caption] @{who}: {body}")
+            elif kind == "reply" or kind is None:
+                who = (c.get("username") or "?").strip()
+                body = (c.get("text") or "").strip()
+                n += 1
+                lines.append(f"{n}. [reply] @{who}: {body}")
         if lines:
-            comments_block = "thread_comments:\n" + "\n".join(lines) + "\n\n"
+            comments_block = "comments:\n" + "\n".join(lines) + "\n\n"
+    text_block = (
+        comments_block
+        if comments_block
+        else f"comments:\n1. [caption] @{user or '?'}: {caption}\n\n"
+        if caption
+        else ""
+    )
     img_note = (
         f"{num_images} image(s) are attached after this text (flyer/carousel)."
         if num_images
-        else "No images could be loaded; use title and caption only."
+        else "No images could be loaded; use title and comments text only."
     )
     schema = """
 Respond with JSON only, with these keys:
@@ -354,8 +380,7 @@ Always include when possible:
         f"shortcode: {shortcode}\n"
         f"permalink: {link}\n"
         f"title: {title}\n"
-        f"caption:\n{caption}\n\n"
-        f"{comments_block}"
+        f"{text_block}"
         f"{img_note}"
     )
 
