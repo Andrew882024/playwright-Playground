@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    JSONB,
     func,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -44,53 +45,36 @@ class Pulse(Base):
 
     __tablename__ = "pulse"
     __table_args__ = (
-        UniqueConstraint("scraped_profile", "shortcode", name="uq_pulse_profile_shortcode"),
+        UniqueConstraint(
+            "profile_username",
+            "post_shortcode",
+            name="uq_pulse_profile_username_post_shortcode",
+        ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
 
-    scraped_profile = Column(String(255), nullable=False, index=True)
-    shortcode = Column(String(32), nullable=False, index=True)
-    permalink = Column(Text, nullable=False)
-    from_username = Column(String(255), nullable=False)
-    title = Column(Text, nullable=True)
-    taken_at = Column(BigInteger, nullable=True)
-    posted_at_utc = Column(DateTime(timezone=True), nullable=True)
-    media_pk = Column(String(64), nullable=True)
-
-    caption_text = Column(Text, nullable=True)
-    thread_comments_text = Column(Text, nullable=True)
-
-    comment_count_total = Column(Integer, nullable=True)
-    comments_incomplete = Column(Boolean, nullable=True)
-
-    primary_media_url = Column(Text, nullable=True)
-    extra_media_urls = Column(Text, nullable=True)
+    profile_username = Column(String(255), nullable=False, index=True)
+    post_shortcode = Column(String(32), nullable=False, index=True)
+    post_url = Column(Text, nullable=False)
+    post_title = Column(Text, nullable=True)
+    posted_unix_seconds = Column(BigInteger, nullable=True)
+    posted_time = Column(DateTime(timezone=True), nullable=True)
+    instagram_media_id = Column(String(64), nullable=True)
+    caption = Column(Text, nullable=True)
+    comments_json = Column(JSONB, nullable=True)
+    main_image_url = Column(Text, nullable=True)
+    additional_image_urls = Column(JSONB, nullable=True)
 
     is_event = Column(Boolean, nullable=True)
     event_title = Column(Text, nullable=True)
     provider_name = Column(Text, nullable=True)
-    description = Column(Text, nullable=True)
-    duration = Column(Text, nullable=True)
-    duration_minutes = Column(Integer, nullable=True)
-    event_description = Column(Text, nullable=True)
+    post_description = Column(Text, nullable=True)
+    duration_in_minutes = Column(Integer, nullable=True)
     confidence = Column(String(16), nullable=True)
-    raw_notes = Column(Text, nullable=True)
-    gemini_model = Column(String(128), nullable=True)
+    ai_model = Column(String(128), nullable=True)
+    event_start_at = Column(DateTime(timezone=True), nullable=True)
+    event_end_at = Column(DateTime(timezone=True), nullable=True)
 
-    event_start_year = Column(Integer, nullable=True)
-    event_start_month = Column(Integer, nullable=True)
-    event_start_day = Column(Integer, nullable=True)
-    event_start_hour = Column(Integer, nullable=True)
-    event_start_minute = Column(Integer, nullable=True)
-    event_start_tz_iana = Column(String(128), nullable=True)
-
-    event_end_year = Column(Integer, nullable=True)
-    event_end_month = Column(Integer, nullable=True)
-    event_end_day = Column(Integer, nullable=True)
-    event_end_hour = Column(Integer, nullable=True)
-    event_end_minute = Column(Integer, nullable=True)
-    event_end_tz_iana = Column(String(128), nullable=True)
-
-    row_created_at = Column(DateTime(timezone=True), server_default=func.now())
-    row_updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
