@@ -4,9 +4,12 @@ Open Instagram in Playwright using cookies from .env (see translate_instagram_co
 Visits each account in tempdata.py via the Following modal, scrolls the profile, and records:
 
 - Raw GraphQL bodies: temp_download_raw/<user>/posts_graphql_*.json
-- Clean scrape bundle: temp_download/<user>/posts.json (title, caption as comment, author, links)
-  plus openable_media_urls.json. Each post's openable_media_urls is
+- Clean scrape bundle: temp_download/<user>/posts.json (title, caption, comments[], taken_at,
+  posting_time_utc, author, links) plus openable_media_urls.json. Each post's openable_media_urls is
   {"largest": [...], "other": [...]} — one best-resolution URL per asset, then remaining variants.
+
+Profile-scroll GraphQL often includes only a preview of comments; comment_count_total and
+comments_incomplete flag when the full thread was not loaded (full threads need pagination / post view).
 
 Uses a persistent Firefox profile; screenshot → test_Instagram/.
 """
@@ -18,6 +21,7 @@ import json
 import random
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlparse
@@ -154,6 +158,132 @@ def _post_caption_text(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _as_positive_int_unix(val: Any) -> int | None:
+    if val is None:
+        return None
+    try:
+        i = int(val)
+    except (TypeError, ValueError):
+        return None
+    if i > 0:
+        return i
+    return None
+
+
+def _post_timestamp_unix(node: dict[str, Any]) -> int | None:
+    """Unix seconds for post time; prefers taken_at, then device_timestamp if present."""
+    for key in ("taken_at", "device_timestamp"):
+        v = _as_positive_int_unix(node.get(key))
+        if v is not None:
+            return v
+    return None
+
+
+def _comment_count_from_node(node: dict[str, Any]) -> int | None:
+    emc = node.get("edge_media_to_comment")
+    if isinstance(emc, dict):
+        c = emc.get("count")
+        if isinstance(c, int) and c >= 0:
+            return c
+    return None
+
+
+def _comment_record_from_graphql_node(n: dict[str, Any]) -> dict[str, Any] | None:
+    text = n.get("text")
+    if not isinstance(text, str):
+        text = ""
+    owner = n.get("owner")
+    username = ""
+    if isinstance(owner, dict):
+        u = owner.get("username")
+        if isinstance(u, str):
+            username = u
+    cid = n.get("id")
+    created = n.get("created_at")
+    return {
+        "id": str(cid) if cid is not None else None,
+        "text": text,
+        "username": username,
+        "created_at": created,
+    }
+
+
+def _raw_comment_nodes_from_media(node: dict[str, Any]) -> list[dict[str, Any]]:
+    raw: list[dict[str, Any]] = []
+    emc = node.get("edge_media_to_comment")
+    if isinstance(emc, dict):
+        edges = emc.get("edges")
+        if isinstance(edges, list):
+            for edge in edges:
+                if isinstance(edge, dict):
+                    cn = edge.get("node")
+                    if isinstance(cn, dict):
+                        raw.append(cn)
+    pc = node.get("preview_comments")
+    if isinstance(pc, list):
+        for item in pc:
+            if not isinstance(item, dict):
+                continue
+            inner = item.get("node")
+            if isinstance(inner, dict):
+                raw.append(inner)
+            elif "text" in item or item.get("id") is not None:
+                raw.append(item)
+    return raw
+
+
+def _comment_dedupe_key(c: dict[str, Any]) -> str:
+    cid = c.get("id")
+    if cid is not None and str(cid).strip():
+        return f"id:{cid}"
+    u = str(c.get("username") or "")
+    t = str(c.get("text") or "")[:400]
+    ct = c.get("created_at")
+    payload = f"{ct}|{u}|{t}"
+    return f"h:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _merge_comment_lists(a: object, b: object) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for lst in (a if isinstance(a, list) else [], b if isinstance(b, list) else []):
+        for c in lst:
+            if not isinstance(c, dict):
+                continue
+            k = _comment_dedupe_key(c)
+            if k not in by_key:
+                by_key[k] = c
+
+    def _sort_key(x: dict[str, Any]) -> tuple[int, str]:
+        ts = x.get("created_at")
+        ti = _as_positive_int_unix(ts)
+        if ti is None:
+            try:
+                ti = int(ts) if ts is not None else 0
+            except (TypeError, ValueError):
+                ti = 0
+        return (ti, str(x.get("username") or ""))
+
+    return sorted(by_key.values(), key=_sort_key)
+
+
+def _comments_structured_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = _raw_comment_nodes_from_media(node)
+    normalized: list[dict[str, Any]] = []
+    for n in raw:
+        normalized.append(_comment_record_from_graphql_node(n))
+    return _merge_comment_lists(normalized, [])
+
+
+def _merge_optional_comment_count(a: object, b: object) -> int | None:
+    ai = a if isinstance(a, int) and a >= 0 else None
+    bi = b if isinstance(b, int) and b >= 0 else None
+    if ai is None:
+        return bi
+    if bi is None:
+        return ai
+    return max(ai, bi)
+
+
 def _from_username(node: dict[str, Any]) -> str | None:
     u = node.get("user")
     if isinstance(u, dict):
@@ -236,14 +366,18 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     if not isinstance(code, str) or not code:
         return
     urls = set(_openable_urls_for_subtree(node))
+    cap = _post_caption_text(node)
     rec = {
         "shortcode": code,
         "permalink": f"{INSTAGRAM_ORIGIN}/p/{code}/",
         "from_username": _from_username(node),
         "title": _post_title(node),
-        "comment": _post_caption_text(node),
+        "caption": cap,
+        "comment": cap,
+        "comments": _comments_structured_from_node(node),
+        "comment_count_total": _comment_count_from_node(node),
         "openable_media_urls": urls,
-        "taken_at": node.get("taken_at"),
+        "taken_at": _post_timestamp_unix(node),
         "media_pk": str(node["pk"]) if node.get("pk") is not None else None,
     }
     if code not in by_shortcode:
@@ -252,12 +386,22 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     prev = by_shortcode[code]
     merged = _coerce_url_set(prev["openable_media_urls"]) | urls
     prev["openable_media_urls"] = merged
-    if prev.get("comment") is None and rec.get("comment") is not None:
+    if prev.get("caption") is None and rec.get("caption") is not None:
+        prev["caption"] = rec["caption"]
         prev["comment"] = rec["comment"]
+    elif prev.get("comment") is None and rec.get("comment") is not None:
+        prev["comment"] = rec["comment"]
+        prev["caption"] = rec["caption"]
     if prev.get("title") is None and rec.get("title") is not None:
         prev["title"] = rec["title"]
     if prev.get("from_username") is None and rec.get("from_username") is not None:
         prev["from_username"] = rec["from_username"]
+    if prev.get("taken_at") is None and rec.get("taken_at") is not None:
+        prev["taken_at"] = rec["taken_at"]
+    mct = _merge_optional_comment_count(prev.get("comment_count_total"), rec.get("comment_count_total"))
+    if mct is not None:
+        prev["comment_count_total"] = mct
+    prev["comments"] = _merge_comment_lists(prev.get("comments"), rec.get("comments"))
 
 
 def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict[str, Any]:
@@ -280,6 +424,19 @@ def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict
     for p in posts:
         raw = p.get("openable_media_urls")
         p["openable_media_urls"] = _organize_instagram_cdn_urls(_coerce_url_set(raw))
+        ts = _as_positive_int_unix(p.get("taken_at"))
+        if ts is not None:
+            p["taken_at"] = ts
+            p["posting_time_utc"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        else:
+            p.pop("posting_time_utc", None)
+        total = p.get("comment_count_total")
+        clist = p.get("comments")
+        n_comments = len(clist) if isinstance(clist, list) else 0
+        if isinstance(total, int) and n_comments < total:
+            p["comments_incomplete"] = True
+        else:
+            p.pop("comments_incomplete", None)
     return {
         "scraped_profile": scraped_username,
         "posts": posts,

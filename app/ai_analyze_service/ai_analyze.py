@@ -119,7 +119,7 @@ Event vs not:
   schedulable occurrence.
 
 Rules:
-- Use the post's title, caption (comment), and any attached images (flyers).
+- Use the post's title, caption, optional thread comments, and any attached images (flyers).
 - Resolve relative dates ("this Saturday", "tomorrow") using the reference datetime provided.
 - If you cannot resolve year/month/day or time from the text, use null for those fields and
   explain in raw_notes. Do not invent a year.
@@ -309,10 +309,22 @@ def _taken_at_reference_line(taken_at: Any, tz: ZoneInfo) -> str:
 
 def _user_prompt(post: dict[str, Any], ref_line: str, num_images: int) -> str:
     title = post.get("title") or ""
-    comment = post.get("comment") or ""
+    caption = (post.get("caption") or post.get("comment") or "").strip()
     user = post.get("from_username") or ""
     link = post.get("permalink") or ""
     shortcode = post.get("shortcode") or ""
+    comments_block = ""
+    raw_comments = post.get("comments")
+    if isinstance(raw_comments, list) and raw_comments:
+        lines: list[str] = []
+        for i, c in enumerate(raw_comments, start=1):
+            if not isinstance(c, dict):
+                continue
+            who = (c.get("username") or "?").strip()
+            body = (c.get("text") or "").strip()
+            lines.append(f"{i}. @{who}: {body}")
+        if lines:
+            comments_block = "thread_comments:\n" + "\n".join(lines) + "\n\n"
     img_note = (
         f"{num_images} image(s) are attached after this text (flyer/carousel)."
         if num_images
@@ -342,7 +354,8 @@ Always include when possible:
         f"shortcode: {shortcode}\n"
         f"permalink: {link}\n"
         f"title: {title}\n"
-        f"caption:\n{comment}\n\n"
+        f"caption:\n{caption}\n\n"
+        f"{comments_block}"
         f"{img_note}"
     )
 
