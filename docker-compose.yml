@@ -1,0 +1,22 @@
+services:
+  postgres:
+    # 17 is a solid current major; pin here for reproducible builds (bump when you upgrade).
+    image: postgres:17-alpine
+    container_name: playwright-playground-postgres
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-playground}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-playground}
+      POSTGRES_DB: ${DB_DATABASE:-playground}
+    ports:
+      # Host port defaults to 5439 so it does not clash with a local Postgres on 5432 (container still listens on 5432).
+      - "${DB_PORT:-5439}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playground -d playground"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
