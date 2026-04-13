@@ -1,12 +1,10 @@
 """
 Open Instagram in Playwright using cookies from INSTAGRAM_COOKIE_FILE (see translate_instagram_cookie_into_playwright_version.py).
 
-Visits each account in tempdata.py via the Following modal, scrolls the profile, and records:
+Visits each account in tempdata.py via the Following modal, scrolls the profile, and upserts posts into
+PostgreSQL (instagram_posts). GraphQL responses are held in memory only (no temp_download / temp_download_raw).
 
-- Raw GraphQL bodies: temp_download_raw/<user>/posts_graphql_*.json
-- Clean scrape bundle: temp_download/<user>/posts.json (title, comments[] with kind caption|reply,
-  taken_at, posting_time_utc, author, links) plus openable_media_urls.json. Each post's openable_media_urls is
-  {"largest": [...], "other": [...]} — one best-resolution URL per asset, then remaining variants.
+Each post's openable_media_urls in the structured bundle is {"largest": [...], "other": [...]}.
 
 Profile-scroll GraphQL often includes only a preview of comments; comment_count_total and
 comments_incomplete flag when the full thread was not loaded (full threads need pagination / post view).
@@ -41,6 +39,7 @@ from translate_instagram_cookie_into_playwright_version import (  # noqa: E402
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+from scrape_db import known_shortcodes_for_profile, upsert_posts_for_profile  # noqa: E402
 from tempdata import following_usernames  # noqa: E402
 
 SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
@@ -48,8 +47,6 @@ SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
 # grant_permissions() + one in-page click (below) match site settings + Instagram’s own “already answered” state.
 PERSISTENT_PROFILE_DIR = PROJECT_ROOT / ".playwright_instagram_profile"
 INSTAGRAM_ORIGIN = "https://www.instagram.com"
-TEMP_DOWNLOAD_RAW = PROJECT_ROOT / "temp_download_raw"
-TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 
 # Early-exit profile scroll: stop when len(known ∩ this_run) > OVERLAP_STOP_THRESHOLD (e.g. 3+ matches).
 OVERLAP_STOP_THRESHOLD = 2
@@ -91,28 +88,6 @@ _MEDIA_URL_KEYS = frozenset(
 
 def _graphql_body_looks_like_posts(body: str) -> bool:
     return any(m in body for m in _POST_GRAPHQL_MARKERS)
-
-
-def _load_known_shortcodes_from_posts_json(path: Path) -> set[str]:
-    """Shortcodes from a prior posts.json scrape; empty set if missing or invalid."""
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    posts = data.get("posts")
-    if not isinstance(posts, list):
-        return set()
-    out: set[str] = set()
-    for p in posts:
-        if not isinstance(p, dict):
-            continue
-        sc = p.get("shortcode")
-        if isinstance(sc, str) and sc:
-            out.add(sc)
-    return out
 
 
 def _extract_timeline_nodes(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -462,13 +437,15 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     )
 
 
-def structured_bundle_from_raw_dir(raw_dir: Path, scraped_username: str) -> dict[str, Any]:
-    """Build posts.json payload from all posts_graphql_*.json under raw_dir."""
+def structured_bundle_from_graphql_bodies(
+    bodies: list[str], scraped_username: str
+) -> dict[str, Any]:
+    """Build the same posts bundle as the old posts.json flow, from in-memory GraphQL JSON strings."""
     by_shortcode: dict[str, dict[str, Any]] = {}
-    for path in sorted(raw_dir.glob("posts_graphql_*.json")):
+    for body_text in bodies:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            data = json.loads(body_text)
+        except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(data, dict):
             continue
@@ -537,12 +514,10 @@ def _collect_cdn_urls(obj: object, out: set[str]) -> None:
 
 
 def _make_graphql_posts_capture(
-    save_dir: Path,
+    bodies_out: list[str],
     shortcodes_out: set[str],
 ) -> tuple[Callable[[Response], None], Callable[[], tuple[list[str], int]]]:
     """Capture GraphQL responses that carry post/media data; return (handler, finalize)."""
-    save_dir.mkdir(parents=True, exist_ok=True)
-    counter: list[int] = [0]
     seen_hash: set[str] = set()
     all_urls: set[str] = set()
 
@@ -567,9 +542,7 @@ def _make_graphql_posts_capture(
         if digest in seen_hash:
             return
         seen_hash.add(digest)
-        counter[0] += 1
-        path = save_dir / f"posts_graphql_{counter[0]:04d}.json"
-        path.write_text(raw, encoding="utf-8")
+        bodies_out.append(raw)
         try:
             data = json.loads(raw)
             _collect_cdn_urls(data, all_urls)
@@ -581,7 +554,7 @@ def _make_graphql_posts_capture(
             pass
 
     def finalize() -> tuple[list[str], int]:
-        return sorted(all_urls), counter[0]
+        return sorted(all_urls), len(bodies_out)
 
     return on_response, finalize
 
@@ -706,12 +679,10 @@ def _try_click_following_row_in_modal(page, dialog, username: str) -> bool:
 def _open_following_profile(page, username: str) -> None:
     """Click the account row inside the open Following modal (not a global .first link — sidebar can be disabled)."""
     u = username.lstrip("@").strip()
-    raw_dir = TEMP_DOWNLOAD_RAW / u
-    clean_dir = TEMP_DOWNLOAD / u
-    clean_dir.mkdir(parents=True, exist_ok=True)
-    known_shortcodes = _load_known_shortcodes_from_posts_json(clean_dir / "posts.json")
+    known_shortcodes = known_shortcodes_for_profile(u)
+    bodies_this_run: list[str] = []
     shortcodes_this_run: set[str] = set()
-    gql_handler, finalize = _make_graphql_posts_capture(raw_dir, shortcodes_this_run)
+    gql_handler, finalize = _make_graphql_posts_capture(bodies_this_run, shortcodes_this_run)
     page.on("response", gql_handler)
     scroll_stopped_early = False
     overlap_at_stop = 0
@@ -737,16 +708,9 @@ def _open_following_profile(page, username: str) -> None:
         page.remove_listener("response", gql_handler)
 
     urls, n_saved = finalize()
-    bundle = structured_bundle_from_raw_dir(raw_dir, u)
+    bundle = structured_bundle_from_graphql_bodies(bodies_this_run, u)
+    n_upserted = upsert_posts_for_profile(u, bundle["posts"])
     organized_all = _organize_instagram_cdn_urls(urls)
-    (clean_dir / "posts.json").write_text(
-        json.dumps(bundle, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (clean_dir / "openable_media_urls.json").write_text(
-        json.dumps(organized_all, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
     n_flat = len(organized_all["largest"]) + len(organized_all["other"])
     exit_note = (
         f", early_exit overlap={overlap_at_stop}"
@@ -754,8 +718,8 @@ def _open_following_profile(page, username: str) -> None:
         else f", scrolls={MAX_PROFILE_SCROLLS} (no early exit)"
     )
     print(
-        f"  {u}: raw posts_graphql × {n_saved} → {raw_dir.relative_to(PROJECT_ROOT)}, "
-        f"posts.json × {len(bundle['posts'])}, openable_media_urls × {n_flat} "
+        f"  {u}: graphql bodies × {n_saved} → postgres rows upserted × {n_upserted}, "
+        f"posts in bundle × {len(bundle['posts'])}, cdn urls × {n_flat} "
         f"({len(organized_all['largest'])} largest / {len(organized_all['other'])} other)"
         f"{exit_note}"
     )

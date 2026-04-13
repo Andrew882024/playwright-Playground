@@ -46,6 +46,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 # Repo root (…/playwright-Playground); file is app/ai_analyze_service/ai_analyze.py
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# Scraper output now lives in PostgreSQL (instagram_posts). This CLI still expects
+# temp_download/<profile>/posts.json; point it at legacy exports or migrate it to read rows from the DB.
 TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
 
 
@@ -161,6 +163,8 @@ class PostAnalysisAI(BaseModel):
     event_description: Optional[str] = None
     confidence: Optional[Literal["low", "medium", "high"]] = None
     raw_notes: Optional[str] = None
+    # Best cover image among those loaded for this request; set after validation in _analyze_post.
+    main_image_url: Optional[str] = None
     # Set by the analyzer after a successful API call (not returned by Gemini JSON).
     gemini_model: Optional[str] = None
 
@@ -317,7 +321,12 @@ def _caption_text_from_post(post: dict[str, Any]) -> str:
     return (leg.strip() if isinstance(leg, str) else "") or ""
 
 
-def _user_prompt(post: dict[str, Any], ref_line: str, num_images: int) -> str:
+def _user_prompt(
+    post: dict[str, Any],
+    ref_line: str,
+    num_images: int,
+    loaded_image_urls: list[str],
+) -> str:
     title = post.get("title") or ""
     caption = _caption_text_from_post(post)
     user = post.get("from_username") or ""
@@ -372,7 +381,17 @@ If is_event is false:
 Always include when possible:
   - confidence: "low" | "medium" | "high"
   - raw_notes (string or null): ambiguities or missing info
+  - main_image_url (string or null): when "Image URLs loaded for analysis" lists one or more URLs below,
+    set this to exactly one of those strings — the single best flyer/cover/carousel slide for this post.
+    If that list is empty, use null.
 """
+    url_block = ""
+    if loaded_image_urls:
+        lines = "\n".join(f"  - {u}" for u in loaded_image_urls)
+        url_block = (
+            "\nImage URLs loaded for analysis (main_image_url must be one of these or null):\n"
+            f"{lines}\n"
+        )
     return (
         f"{schema}\n\n"
         f"{ref_line}\n\n"
@@ -382,6 +401,7 @@ Always include when possible:
         f"title: {title}\n"
         f"{text_block}"
         f"{img_note}"
+        f"{url_block}"
     )
 
 
@@ -520,16 +540,18 @@ def _analyze_post(
     ref = _taken_at_reference_line(post.get("taken_at"), tz)
     urls = _image_urls_from_post(post)
     image_parts: list[types.Part] = []
+    loaded_image_urls: list[str] = []
     fetch_notes: list[str] = []
     for u in urls:
         got = _fetch_image(u)
         if got:
             data, mime = got
             image_parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+            loaded_image_urls.append(u)
         else:
             fetch_notes.append(f"failed to fetch image: {u[:80]}…")
 
-    base_prompt = _user_prompt(post, ref, len(image_parts))
+    base_prompt = _user_prompt(post, ref, len(image_parts), loaded_image_urls)
 
     config = types.GenerateContentConfig(
         system_instruction=_SYSTEM_INSTRUCTION,
@@ -570,6 +592,15 @@ def _analyze_post(
                 if fetch_notes:
                     extra = "Images: " + "; ".join(fetch_notes)
                     upd["raw_notes"] = f"{notes}\n{extra}".strip() if notes else extra
+                allowed = set(loaded_image_urls)
+                cand = (ai.main_image_url or "").strip() if ai.main_image_url else ""
+                if len(loaded_image_urls) == 1:
+                    final_main: str | None = loaded_image_urls[0]
+                elif cand in allowed:
+                    final_main = cand
+                else:
+                    final_main = None
+                upd["main_image_url"] = final_main
                 ai = ai.model_copy(update=upd)
                 return ai, model_idx
             except ClientError as e:
