@@ -15,9 +15,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
-    JSONB,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
@@ -26,7 +26,7 @@ load_dotenv()
 db_username = os.getenv("DB_USERNAME", "playground")
 db_password = os.getenv("DB_PASSWORD", "playground")
 db_hostname = os.getenv("DB_HOSTNAME", "localhost")
-db_port = os.getenv("DB_PORT", "5433")
+db_port = os.getenv("DB_PORT", "5439")
 db_database = os.getenv("DB_DATABASE", "playground")
 
 db_url = f"postgresql+psycopg2://{db_username}:{db_password}@{db_hostname}:{db_port}/{db_database}"
@@ -40,15 +40,15 @@ Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-class Pulse(Base):
+class InstagramPosts(Base):
     """One row per scraped Instagram post (and optional AI enrichment)."""
 
-    __tablename__ = "pulse"
+    __tablename__ = "instagram_posts"
     __table_args__ = (
         UniqueConstraint(
             "profile_username",
             "post_shortcode",
-            name="uq_pulse_profile_username_post_shortcode",
+            name="uq_instagram_posts_profile_username_post_shortcode",
         ),
     )
 
