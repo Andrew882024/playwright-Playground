@@ -4,7 +4,8 @@ Open Instagram in Playwright using cookies from INSTAGRAM_COOKIE_FILE (see trans
 Visits each account in tempdata.py via the Following modal, scrolls the profile, and upserts posts into
 PostgreSQL (instagram_posts). GraphQL responses are held in memory only (no temp_download / temp_download_raw).
 
-Each post's openable_media_urls in the structured bundle is {"largest": [...], "other": [...]}.
+Each post's openable_media_urls in the structured bundle is {"largest": [...], "other": [...]} —
+only URLs from the post's own media (not profile/avatar images from user or comment objects).
 
 Profile-scroll GraphQL often includes only a preview of comments; comment_count_total and
 comments_incomplete flag when the full thread was not loaded (full threads need pagination / post view).
@@ -74,16 +75,104 @@ _POST_GRAPHQL_MARKERS = (
     "edge_media_preview",
 )
 
-# JSON keys whose string values are usually real image/video URLs once parsed (fixes \\u0026 vs &).
+# JSON keys whose string values are usually post image/video URLs (not account avatars).
 _MEDIA_URL_KEYS = frozenset(
     {
         "display_url",
         "video_url",
         "thumbnail_src",
-        "profile_pic_url",
         "url",
     }
 )
+
+# Never treat these as post media (account avatars, header art, etc.).
+_CDN_URL_KEY_EXCLUDES = frozenset(
+    {
+        "profile_pic_url",
+        "hd_profile_pic_url",
+        "profile_pic_url_hd",
+        "borderless_profile_pic_url",
+        "delegate_page_profile_pic_url",
+    }
+)
+
+
+def _cdn_url_key_excluded(key: str) -> bool:
+    k = key.lower()
+    if key in _CDN_URL_KEY_EXCLUDES:
+        return True
+    if "profile_pic" in k or k.endswith("_profile_pic_url"):
+        return True
+    if "avatar" in k and "_url" in k:
+        return True
+    return False
+
+
+def _add_if_instagram_cdn(val: object, out: set[str]) -> None:
+    if not isinstance(val, str) or not val.startswith("https://"):
+        return
+    if "cdninstagram" in val or "fbcdn.net" in val or "instagram.com" in val:
+        out.add(val)
+
+
+def _collect_urls_from_image_versions_tree(obj: object, out: set[str]) -> None:
+    """image_versions2 / nested candidates use dicts with a url field."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "url":
+                _add_if_instagram_cdn(v, out)
+            else:
+                _collect_urls_from_image_versions_tree(v, out)
+    elif isinstance(obj, list):
+        for x in obj:
+            _collect_urls_from_image_versions_tree(x, out)
+
+
+def _post_media_cdn_urls_from_timeline_node(node: dict[str, Any]) -> set[str]:
+    """CDN URLs for the post body only (not owner/commenter profile pictures)."""
+    out: set[str] = set()
+    _add_if_instagram_cdn(node.get("display_url"), out)
+    _add_if_instagram_cdn(node.get("thumbnail_src"), out)
+    _add_if_instagram_cdn(node.get("video_url"), out)
+    _collect_urls_from_image_versions_tree(node.get("image_versions2"), out)
+    _collect_urls_from_image_versions_tree(node.get("image_versions"), out)
+
+    dr = node.get("display_resources")
+    if isinstance(dr, list):
+        for r in dr:
+            if isinstance(r, dict):
+                _add_if_instagram_cdn(r.get("src"), out)
+
+    cm = node.get("carousel_media")
+    if isinstance(cm, list):
+        for item in cm:
+            if isinstance(item, dict):
+                _add_if_instagram_cdn(item.get("display_url"), out)
+                _add_if_instagram_cdn(item.get("thumbnail_src"), out)
+                _collect_urls_from_image_versions_tree(item.get("image_versions2"), out)
+                _collect_urls_from_image_versions_tree(item.get("image_versions"), out)
+
+    esc = node.get("edge_sidecar_to_children")
+    if isinstance(esc, dict):
+        edges = esc.get("edges")
+        if isinstance(edges, list):
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                child = edge.get("node")
+                if isinstance(child, dict):
+                    _add_if_instagram_cdn(child.get("display_url"), out)
+                    _add_if_instagram_cdn(child.get("thumbnail_src"), out)
+                    _collect_urls_from_image_versions_tree(child.get("image_versions2"), out)
+                    _collect_urls_from_image_versions_tree(child.get("image_versions"), out)
+
+    vv = node.get("video_versions")
+    if isinstance(vv, list):
+        for ent in vv:
+            if isinstance(ent, dict):
+                _add_if_instagram_cdn(ent.get("url"), out)
+
+    return out
 
 
 def _graphql_body_looks_like_posts(body: str) -> bool:
@@ -329,9 +418,11 @@ def _from_username(node: dict[str, Any]) -> str | None:
     return None
 
 
-def _openable_urls_for_subtree(obj: object) -> list[str]:
-    found: set[str] = set()
-    _collect_cdn_urls(obj, found)
+def _openable_urls_for_post_node(node: dict[str, Any]) -> list[str]:
+    """Post-attached media only; excludes account avatars from nested user/comment objects."""
+    found = _post_media_cdn_urls_from_timeline_node(node)
+    if not found:
+        _collect_cdn_urls_excluding_account_images(node, found)
     return sorted(found)
 
 
@@ -401,7 +492,7 @@ def _merge_structured_posts(by_shortcode: dict[str, dict[str, Any]], node: dict[
     code = node.get("code")
     if not isinstance(code, str) or not code:
         return
-    urls = set(_openable_urls_for_subtree(node))
+    urls = set(_openable_urls_for_post_node(node))
     rec = {
         "shortcode": code,
         "permalink": f"{INSTAGRAM_ORIGIN}/p/{code}/",
@@ -496,10 +587,14 @@ def structured_bundle_from_graphql_bodies(
     }
 
 
-def _collect_cdn_urls(obj: object, out: set[str]) -> None:
-    """Gather https URLs that look like Instagram/Facebook CDN media (openable in a browser)."""
+def _collect_cdn_urls_excluding_account_images(obj: object, out: set[str]) -> None:
+    """Gather Instagram/Facebook CDN media URLs; skip keys used for avatars / profile art."""
     if isinstance(obj, dict):
         for k, v in obj.items():
+            if _cdn_url_key_excluded(k):
+                if not isinstance(v, str):
+                    _collect_cdn_urls_excluding_account_images(v, out)
+                continue
             if isinstance(v, str) and v.startswith("https://") and (
                 k in _MEDIA_URL_KEYS
                 or (k.endswith("_url") and ("instagram" in v or "fbcdn" in v))
@@ -507,10 +602,10 @@ def _collect_cdn_urls(obj: object, out: set[str]) -> None:
                 if "cdninstagram" in v or "fbcdn.net" in v or "instagram.com" in v:
                     out.add(v)
             else:
-                _collect_cdn_urls(v, out)
+                _collect_cdn_urls_excluding_account_images(v, out)
     elif isinstance(obj, list):
         for x in obj:
-            _collect_cdn_urls(x, out)
+            _collect_cdn_urls_excluding_account_images(x, out)
 
 
 def _make_graphql_posts_capture(
@@ -545,7 +640,7 @@ def _make_graphql_posts_capture(
         bodies_out.append(raw)
         try:
             data = json.loads(raw)
-            _collect_cdn_urls(data, all_urls)
+            _collect_cdn_urls_excluding_account_images(data, all_urls)
             for node in _extract_timeline_nodes(data):
                 code = node.get("code")
                 if isinstance(code, str) and code:
