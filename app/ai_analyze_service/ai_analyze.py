@@ -44,6 +44,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -104,7 +105,7 @@ def _load_env() -> None:
 _load_env()
 
 from Blueprint_db import InstagramPosts, SessionLocal  # noqa: E402
-from sqlalchemy import func, select, update  # noqa: E402
+from sqlalchemy import func, select  # noqa: E402
 
 # Stable model ids; see https://ai.google.dev/gemini-api/docs/models
 # Order: primary (GEMINI_MODEL) then these, deduped. All are commonly available on the free tier;
@@ -152,6 +153,12 @@ Rules:
   convert and note ambiguity in raw_notes.
 - For non-events, description must be prose; for events, event_description must be prose.
   Each must be 50–200 words (count whitespace-separated tokens), inclusive.
+- main_image_url (when images are provided): pick the single image that best represents this post
+  in a small feed card. For events, prefer the slide/flyer with the clearest title, date, time, and
+  location; avoid a purely decorative slide if another slide has the schedule. For non-events,
+  prefer the strongest visual summary (hero graphic, infographic, or clearest message). Prefer
+  legible text and the slide that would make someone understand the post without reading the caption.
+  The value must be exactly one of the listed loaded image URL strings when multiple URLs exist.
 """
 
 
@@ -306,9 +313,23 @@ class PostAnalysisAI(BaseModel):
         return self
 
 
-def _ai_to_db_update_values(ai: PostAnalysisAI, default_tz: ZoneInfo) -> dict[str, Any]:
+def _primary_image_url_from_post(post: dict[str, Any]) -> str | None:
+    """First CDN image URL from the scrape bundle (same filters as loads sent to Gemini)."""
+    urls = _image_urls_from_post(post)
+    return urls[0] if urls else None
+
+
+def _ai_to_db_update_values(
+    ai: PostAnalysisAI,
+    default_tz: ZoneInfo,
+    *,
+    fallback_main_image_url: str | None = None,
+) -> dict[str, Any]:
     start_at = _datetime_from_parts(ai.start, default_tz) if ai.is_event else None
     end_at = _datetime_from_parts(ai.end, default_tz) if ai.is_event else None
+    chosen = (ai.main_image_url or "").strip() if ai.main_image_url else ""
+    fb = (fallback_main_image_url or "").strip() if fallback_main_image_url else ""
+    main_url: str | None = chosen if chosen else (fb if fb else None)
     return {
         "is_event": ai.is_event,
         "event_title": (ai.event_title or "").strip() if ai.is_event else None,
@@ -319,8 +340,7 @@ def _ai_to_db_update_values(ai: PostAnalysisAI, default_tz: ZoneInfo) -> dict[st
         "ai_model": ai.gemini_model,
         "event_start_at": start_at,
         "event_end_at": end_at,
-        "main_image_url": ai.main_image_url,
-        "updated_at": func.now(),
+        "main_image_url": main_url,
     }
 
 
@@ -526,9 +546,10 @@ If is_event is false:
 Always include when possible:
   - confidence: "low" | "medium" | "high"
   - raw_notes (string or null): ambiguities or missing info
-  - main_image_url (string or null): when "Image URLs loaded for analysis" lists one or more URLs below,
-    set this to exactly one of those strings — the single best flyer/cover/carousel slide for this post.
-    If that list is empty, use null.
+  - main_image_url (string or null): when "Image URLs loaded for analysis" lists URLs below, set this
+    to exactly one of those strings (copy verbatim) — the single image that best represents the post
+    in a feed (events: clearest title/date/time/location on a flyer; non-events: strongest visual hook
+    or clearest message; prefer legible text over decorative-only slides). If that list is empty, use null.
 """
     url_block = ""
     if loaded_image_urls:
@@ -649,6 +670,70 @@ def _clip_one_line(s: str, max_len: int) -> str:
     return t if len(t) <= max_len else t[: max_len - 1] + "…"
 
 
+def _cdn_url_match_key(url: str) -> str:
+    """Compare CDN URLs ignoring query/fragment and trivial scheme/host casing."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    parsed = urlparse(u)
+    scheme = (parsed.scheme or "https").lower()
+    if scheme == "http":
+        scheme = "https"
+    netloc = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    return f"{scheme}://{netloc}{path}"
+
+
+def _resolve_main_image_url(
+    cand_raw: str | None,
+    loaded: list[str],
+    *,
+    shortcode_label: str,
+) -> tuple[str | None, str | None]:
+    """Pick canonical main_image_url from model output and loaded URLs.
+
+    Returns (url_or_none, extra_raw_notes_line). When multiple images were loaded, we always
+    return a non-null URL (first in carousel order as feed-safe default if the model omits or
+    picks an unmatched string). stderr logs normalization and fallback paths.
+    """
+    if not loaded:
+        return None, None
+    if len(loaded) == 1:
+        return loaded[0], None
+
+    cand = (cand_raw or "").strip()
+    allowed_set = set(loaded)
+    if cand in allowed_set:
+        return cand, None
+
+    key_to_canonical: dict[str, str] = {}
+    for u in loaded:
+        k = _cdn_url_match_key(u)
+        if k and k not in key_to_canonical:
+            key_to_canonical[k] = u
+
+    if cand:
+        kc = _cdn_url_match_key(cand)
+        if kc and kc in key_to_canonical:
+            chosen = key_to_canonical[kc]
+            if chosen != cand:
+                msg = "main_image_url matched a loaded image after URL normalization (model string differed)."
+                print(f"  AI [{shortcode_label}]: {msg}", file=sys.stderr)
+                return chosen, msg
+            return chosen, None
+
+    fallback = loaded[0]
+    if cand:
+        msg = (
+            "main_image_url not in loaded set after normalization; "
+            "defaulted to first loaded image (Instagram cover order)."
+        )
+    else:
+        msg = "main_image_url omitted by model; defaulted to first loaded image (Instagram cover order)."
+    print(f"  AI [{shortcode_label}]: {msg}", file=sys.stderr)
+    return fallback, msg
+
+
 def _format_ai_terminal_summary(shortcode: str, ai: PostAnalysisAI) -> str:
     """Human-readable one-line summary of a successful analysis (stdout)."""
     conf = ai.confidence or "?"
@@ -716,15 +801,18 @@ def _analyze_post(
     for model_idx, model in enumerate(model_chain[idx0:], start=idx0):
         quota_try_next = False
         for attempt in range(3):
-            fix = (
-                ""
-                if attempt == 0
-                else (
-                    "\n\nYour previous output was invalid. Output only valid JSON matching the schema. "
-                    f"If is_event is false, description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words; "
-                    f"if true, event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words."
+            _fix_parts = [
+                "\n\nYour previous output was invalid. Output only valid JSON matching the schema. ",
+                f"If is_event is false, description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words; "
+                f"if true, event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words.",
+            ]
+            if attempt > 0 and len(loaded_image_urls) > 1:
+                _fix_parts.append(
+                    " When multiple images were loaded, main_image_url must be exactly one of the "
+                    "listed \"Image URLs loaded for analysis\" strings (character-for-character copy), "
+                    "choosing the single best representative slide for the post."
                 )
-            )
+            fix = "" if attempt == 0 else "".join(_fix_parts)
             contents = [*image_parts, base_prompt + fix]
             try:
                 resp = _generate_content_with_429_retry(
@@ -738,17 +826,16 @@ def _analyze_post(
                 ai = PostAnalysisAI.model_validate(data)
                 notes = (ai.raw_notes or "").strip()
                 upd: dict[str, Any] = {"gemini_model": model}
+                final_main, main_note = _resolve_main_image_url(
+                    ai.main_image_url,
+                    loaded_image_urls,
+                    shortcode_label=label,
+                )
+                raw_parts: list[str] = [s for s in (notes, main_note) if s]
                 if fetch_notes:
-                    extra = "Images: " + "; ".join(fetch_notes)
-                    upd["raw_notes"] = f"{notes}\n{extra}".strip() if notes else extra
-                allowed = set(loaded_image_urls)
-                cand = (ai.main_image_url or "").strip() if ai.main_image_url else ""
-                if len(loaded_image_urls) == 1:
-                    final_main: str | None = loaded_image_urls[0]
-                elif cand in allowed:
-                    final_main = cand
-                else:
-                    final_main = None
+                    raw_parts.append("Images: " + "; ".join(fetch_notes))
+                if raw_parts:
+                    upd["raw_notes"] = "\n".join(raw_parts)
                 upd["main_image_url"] = final_main
                 ai = ai.model_copy(update=upd)
                 return ai, model_idx
@@ -919,16 +1006,21 @@ def process_profile_db(
                 client, model_chain, post, tz, start_idx=chain_offset
             )
             chain_offset = used_idx
-            vals = _ai_to_db_update_values(ai, tz)
+            vals = _ai_to_db_update_values(
+                ai,
+                tz,
+                fallback_main_image_url=_primary_image_url_from_post(post),
+            )
             with SessionLocal() as session:
-                session.execute(
-                    update(InstagramPosts)
-                    .where(
+                obj = session.execute(
+                    select(InstagramPosts).where(
                         InstagramPosts.profile_username == pn,
                         InstagramPosts.post_shortcode == row.post_shortcode,
                     )
-                    .values(**vals)
-                )
+                ).scalar_one()
+                for attr, value in vals.items():
+                    setattr(obj, attr, value)
+                obj.updated_at = datetime.now(timezone.utc)
                 session.commit()
             analyzed += 1
             sc_str = sc if isinstance(sc, str) else "?"
