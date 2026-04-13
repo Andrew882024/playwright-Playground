@@ -1,5 +1,5 @@
 """
-For instagram_posts rows that are AI-analyzed and have a main_image_url but no own S3 URL:
+For instagram_posts rows where is_event is true, AI-analyzed, main_image_url set, and own S3 URL empty:
 download the image, upload to the configured S3 bucket, save own_s3_url_for_main_image.
 
 Requires in .env (see Blueprint_db / project root):
@@ -15,11 +15,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import ssl
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+import certifi
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -62,9 +65,18 @@ def _mime_from_url(url: str) -> str:
 
 
 def _fetch_image(url: str) -> tuple[bytes, str] | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    # macOS/Framework Python often lacks a usable default CA store for CDN TLS;
+    # certifi supplies Mozilla's CA bundle so Instagram CDN URLs verify.
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.instagram.com/",
+        },
+    )
     try:
-        with urlopen(req, timeout=60) as resp:
+        with urlopen(req, timeout=60, context=ssl_ctx) as resp:
             data = resp.read()
             ctype = resp.headers.get_content_type()
             if ctype and ctype.startswith("image/"):
@@ -111,6 +123,7 @@ def rows_to_backfill(profile: str | None, limit: int | None) -> list[InstagramPo
     stmt = (
         select(InstagramPosts)
         .where(
+            InstagramPosts.is_event.is_(True),
             trimmed_main.isnot(None),
             InstagramPosts.ai_analyzed.is_(True),
             or_(
@@ -137,7 +150,7 @@ def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool) -> in
 
     rows = rows_to_backfill(profile, limit)
     if not rows:
-        print("No matching rows (main_image_url set, ai_analyzed, own_s3_url empty).")
+        print("No matching rows (is_event, main_image_url set, ai_analyzed, own_s3_url empty).")
         return 0
 
     client = None if dry_run else _s3_client()
@@ -185,7 +198,9 @@ def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool) -> in
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Backfill own_s3_url_for_main_image via S3 upload.")
+    p = argparse.ArgumentParser(
+        description="Backfill own_s3_url_for_main_image via S3 upload (is_event rows only).",
+    )
     p.add_argument("--profile", type=str, default=None, help="Only this instagram_posts.profile_username")
     p.add_argument("--limit", type=int, default=None, help="Max rows to process")
     p.add_argument("--dry-run", action="store_true", help="List rows only; no download/S3/DB writes")
