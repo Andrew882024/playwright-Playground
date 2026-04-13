@@ -112,8 +112,7 @@ def rows_to_backfill(profile: str | None, limit: int | None) -> list[InstagramPo
         select(InstagramPosts)
         .where(
             trimmed_main.isnot(None),
-            InstagramPosts.ai_model.isnot(None),
-            func.trim(InstagramPosts.ai_model) != "",
+            InstagramPosts.ai_analyzed.is_(True),
             or_(
                 InstagramPosts.own_s3_url_for_main_image.is_(None),
                 trimmed_own.is_(None),
@@ -138,7 +137,7 @@ def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool) -> in
 
     rows = rows_to_backfill(profile, limit)
     if not rows:
-        print("No matching rows (main_image_url set, ai_model set, own_s3_url empty).")
+        print("No matching rows (main_image_url set, ai_analyzed, own_s3_url empty).")
         return 0
 
     client = None if dry_run else _s3_client()

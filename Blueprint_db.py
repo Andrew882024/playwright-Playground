@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -73,6 +74,7 @@ class InstagramPosts(Base):
     duration_in_minutes = Column(Integer, nullable=True)
     confidence = Column(String(16), nullable=True)
     ai_model = Column(String(128), nullable=True)
+    ai_analyzed = Column(Boolean,nullable=False, server_default=false())
     event_start_at = Column(DateTime(timezone=True), nullable=True)
     event_end_at = Column(DateTime(timezone=True), nullable=True)
 

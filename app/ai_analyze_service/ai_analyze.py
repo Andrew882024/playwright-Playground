@@ -23,7 +23,7 @@ Usage:
     # DB: all profiles with posts in the recent window
   python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --limit 3
   python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --resume
-    # skip rows that already have ai_model set
+    # skip rows that already have ai_analyzed true (--resume)
   python -m app.ai_analyze_service.ai_analyze --use-temp-download --profile foo  # legacy JSON
 
 Model fallback chain (rate/quota):
@@ -338,6 +338,7 @@ def _ai_to_db_update_values(
         "duration_in_minutes": ai.duration_minutes,
         "confidence": ai.confidence,
         "ai_model": ai.gemini_model,
+        "ai_analyzed": True,
         "event_start_at": start_at,
         "event_end_at": end_at,
         "main_image_url": main_url,
@@ -940,7 +941,7 @@ def _fetch_instagram_rows_for_profile(
     stmt = select(InstagramPosts).where(InstagramPosts.profile_username == pn)
     stmt = stmt.where(_posted_at_coalesce_utc() >= cutoff)
     if resume:
-        stmt = stmt.where(InstagramPosts.ai_model.is_(None))
+        stmt = stmt.where(InstagramPosts.ai_analyzed.is_(False))
     stmt = stmt.order_by(
         InstagramPosts.posted_time.desc().nulls_last(),
         InstagramPosts.posted_unix_seconds.desc().nulls_last(),
@@ -989,7 +990,7 @@ def process_profile_db(
             f"posted within the last {AI_ANALYZE_RECENT_DAYS} days",
         ]
         if resume:
-            parts.append("with ai_model IS NULL")
+            parts.append("with ai_analyzed = false")
         print(" ".join(parts), file=sys.stderr)
         return chain_start_idx
 
@@ -1143,7 +1144,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="DB: only rows where ai_model IS NULL. Legacy: reuse posts_ai.json ai blocks by shortcode",
+        help="DB: only rows where ai_analyzed is false. Legacy: reuse posts_ai.json ai blocks by shortcode",
     )
     parser.add_argument(
         "--sleep",
