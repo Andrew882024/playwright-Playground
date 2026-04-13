@@ -76,5 +76,7 @@ class InstagramPosts(Base):
     event_start_at = Column(DateTime(timezone=True), nullable=True)
     event_end_at = Column(DateTime(timezone=True), nullable=True)
 
+    own_s3_url_for_main_image = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
