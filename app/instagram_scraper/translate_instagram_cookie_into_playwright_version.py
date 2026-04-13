@@ -1,5 +1,7 @@
 """
-Load Instagram cookies from .env (Firefox export JSON) and convert them to Playwright cookie dicts.
+Load Instagram cookies from a JSON file (Firefox export) and convert them to Playwright cookie dicts.
+
+Set INSTAGRAM_COOKIE_FILE in the environment or in `.env` (path relative to repo root).
 
 Does not open a browser — use sync_ins.py for that.
 """
@@ -89,33 +91,6 @@ def firefox_export_to_playwright_cookies(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _parse_cookie_json_from_env_file(env_path: Path, key: str) -> str:
-    """Read multi-line value for KEY=... from .env."""
-    text = env_path.read_text(encoding="utf-8")
-    idx = text.find(key)
-    if idx == -1:
-        raise SystemExit(f"Missing {key} in {env_path}")
-    j = idx + len(key)
-    while j < len(text) and text[j] in " \t":
-        j += 1
-    if j >= len(text) or text[j] != "=":
-        raise SystemExit(f"Expected = after {key} in {env_path}")
-    j += 1
-    rest = text[j:].lstrip("\n")
-    m = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_]*\s*=", rest)
-    if m and m.start() > 0:
-        rest = rest[: m.start()].rstrip()
-    rest = rest.strip()
-    try:
-        _load_firefox_cookie_json(rest)
-    except json.JSONDecodeError as e:
-        raise SystemExit(
-            f"Could not parse {key} as JSON in {env_path}: {e}. "
-            "Use INSTAGRAM_COOKIE_FILE pointing at a .json file if needed."
-        ) from e
-    return rest
-
-
 def _read_scalar_env(env_path: Path, key: str) -> str | None:
     """Single-line KEY=value from .env."""
     if not env_path.is_file():
@@ -130,41 +105,30 @@ def _read_scalar_env(env_path: Path, key: str) -> str | None:
 
 
 def _load_cookie_raw() -> str:
+    """Load Firefox cookie export JSON from INSTAGRAM_COOKIE_FILE (required)."""
     env_path = PROJECT_ROOT / ".env"
     path_str = (
         os.environ.get("INSTAGRAM_COOKIE_FILE", "").strip()
         or (_read_scalar_env(env_path, "INSTAGRAM_COOKIE_FILE") or "")
     )
-    if path_str:
-        p = (PROJECT_ROOT / path_str).resolve()
-        if p.is_file():
-            return p.read_text(encoding="utf-8")
+    if not path_str:
+        raise SystemExit(
+            "Set INSTAGRAM_COOKIE_FILE to a JSON file path (Firefox cookie export), "
+            f"either in the environment or in {env_path} (path relative to repo root)."
+        )
+    p = (PROJECT_ROOT / path_str).resolve()
+    if not p.is_file():
         raise SystemExit(f"INSTAGRAM_COOKIE_FILE not found: {p}")
-
-    raw = os.environ.get("INSTAGRAM_RAW_COOKIE_FROM_FIREFOX", "").strip()
-    if raw.startswith("[") and len(raw) > 10:
-        try:
-            _load_firefox_cookie_json(raw)
-            return raw
-        except json.JSONDecodeError:
-            pass
-
-    if env_path.is_file():
-        return _parse_cookie_json_from_env_file(env_path, "INSTAGRAM_RAW_COOKIE_FROM_FIREFOX")
-
-    raise SystemExit(
-        "Missing INSTAGRAM_RAW_COOKIE_FROM_FIREFOX in .env (Firefox cookie JSON), "
-        "or INSTAGRAM_COOKIE_FILE."
-    )
+    return p.read_text(encoding="utf-8")
 
 
 def load_instagram_cookies_for_playwright() -> list[dict]:
-    """Read .env / cookie file, parse Firefox export, return Playwright-ready cookie list."""
+    """Read cookie JSON file, parse Firefox export, return Playwright-ready cookie list."""
     raw = _load_cookie_raw()
     rows = _load_firefox_cookie_json(raw)
     cookies = firefox_export_to_playwright_cookies(rows)
     if not cookies:
-        raise SystemExit("No cookies parsed; check INSTAGRAM_RAW_COOKIE_FROM_FIREFOX format.")
+        raise SystemExit("No cookies parsed; check INSTAGRAM_COOKIE_FILE JSON format.")
     return cookies
 
 

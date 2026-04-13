@@ -1,6 +1,8 @@
 venv/
 .playwright_instagram_profile/
 .env
+# Firefox-export cookie JSON (see INSTAGRAM_COOKIE_FILE in .env.example)
+instagram_cookies*.json
 temp_download/
 temp_download_raw/
 __pycache__/

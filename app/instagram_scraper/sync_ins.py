@@ -1,5 +1,5 @@
 """
-Open Instagram in Playwright using cookies from .env (see translate_instagram_cookie_into_playwright_version.py).
+Open Instagram in Playwright using cookies from INSTAGRAM_COOKIE_FILE (see translate_instagram_cookie_into_playwright_version.py).
 
 Visits each account in tempdata.py via the Following modal, scrolls the profile, and records:
 

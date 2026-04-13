@@ -1,3 +1,25 @@
+# --- Quick reference (run from this repo root) ---
+#
+# Bring Postgres up (detached):
+#   docker compose up -d
+#
+# Stop and remove the container (data in volume `postgres_data` is kept):
+#   docker compose down
+#
+# Stop and remove container + volume (wipes the database):
+#   docker compose down -v
+#
+# Port mapping below is HOST:CONTAINER — first number is your machine (default 5439),
+# second is Postgres inside the container (always 5432). Connect from the host with
+# DB_PORT (e.g. 5439), user/password/db from .env or defaults playground/playground.
+#
+# Open psql on your host (needs `psql` installed):
+#   psql "postgresql://${DB_USERNAME:-playground}:${DB_PASSWORD:-playground}@127.0.0.1:${DB_PORT:-5439}/${DB_DATABASE:-playground}"
+#
+# Or a shell inside the container, then psql there (port 5432, user/db as above):
+#   docker exec -it playwright-playground-postgres sh
+#   psql -U playground -d playground
+#
 services:
   postgres:
     # 17 is a solid current major; pin here for reproducible builds (bump when you upgrade).
