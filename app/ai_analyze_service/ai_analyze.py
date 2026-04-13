@@ -111,6 +111,7 @@ from sqlalchemy import func, select  # noqa: E402
 # Order: primary (GEMINI_MODEL) then these, deduped. All are commonly available on the free tier;
 # exact quotas vary by model and region—check AI Studio rate limits.
 DEFAULT_MODEL = "gemini-2.5-flash"
+# DEFAULT_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_MODEL_FALLBACK_CHAIN: tuple[str, ...] = (
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
@@ -153,6 +154,9 @@ Rules:
   convert and note ambiguity in raw_notes.
 - For non-events, description must be prose; for events, event_description must be prose.
   Each must be 50–200 words (count whitespace-separated tokens), inclusive.
+- location: when the post states where something happens (room, building, campus, address,
+  city/neighborhood, or "Online" / a meeting link), output a short human-readable string; use null
+  if no place is given or it does not apply.
 - main_image_url (when images are provided): pick the single image that best represents this post
   in a small feed card. For events, prefer the slide/flyer with the clearest title, date, time, and
   location; avoid a purely decorative slide if another slide has the schedule. For non-events,
@@ -279,6 +283,7 @@ class PostAnalysisAI(BaseModel):
     event_description: Optional[str] = None
     confidence: Optional[Literal["low", "medium", "high"]] = None
     raw_notes: Optional[str] = None
+    location: Optional[str] = None
     # Best cover image among those loaded for this request; set after validation in _analyze_post.
     main_image_url: Optional[str] = None
     # Set by the analyzer after a successful API call (not returned by Gemini JSON).
@@ -330,6 +335,7 @@ def _ai_to_db_update_values(
     chosen = (ai.main_image_url or "").strip() if ai.main_image_url else ""
     fb = (fallback_main_image_url or "").strip() if fallback_main_image_url else ""
     main_url: str | None = chosen if chosen else (fb if fb else None)
+    loc = (ai.location or "").strip()
     return {
         "is_event": ai.is_event,
         "event_title": (ai.event_title or "").strip() if ai.is_event else None,
@@ -342,6 +348,7 @@ def _ai_to_db_update_values(
         "event_start_at": start_at,
         "event_end_at": end_at,
         "main_image_url": main_url,
+        "location": loc if loc else None,
     }
 
 
@@ -547,6 +554,8 @@ If is_event is false:
 Always include when possible:
   - confidence: "low" | "medium" | "high"
   - raw_notes (string or null): ambiguities or missing info
+  - location (string or null): venue, building/room, campus, neighborhood, address, or Online / meeting link
+    if clearly stated; otherwise null
   - main_image_url (string or null): when "Image URLs loaded for analysis" lists URLs below, set this
     to exactly one of those strings (copy verbatim) — the single image that best represents the post
     in a feed (events: clearest title/date/time/location on a flyer; non-events: strongest visual hook
@@ -750,6 +759,8 @@ def _format_ai_terminal_summary(shortcode: str, ai: PostAnalysisAI) -> str:
         elif ai.start and ai.start.year and ai.start.month and ai.start.day:
             y, m, d = ai.start.year, ai.start.month, ai.start.day
             parts.append(f"start={y:04d}-{m:02d}-{d:02d}")
+        if (ai.location or "").strip():
+            parts.append(f'loc="{_clip_one_line(ai.location or "", 56)}"')
         body = " | ".join(parts)
         return f"  AI [{sc}] model={mod} {conf}: event — {body}"
     desc = _clip_one_line(ai.description or "", 110)

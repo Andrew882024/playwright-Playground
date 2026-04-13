@@ -71,6 +71,7 @@ class InstagramPosts(Base):
     event_title = Column(Text, nullable=True)
     provider_name = Column(Text, nullable=True)
     post_description = Column(Text, nullable=True)
+    location = Column(Text, nullable=True)
     duration_in_minutes = Column(Integer, nullable=True)
     confidence = Column(String(16), nullable=True)
     ai_model = Column(String(128), nullable=True)
