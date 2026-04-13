@@ -1,21 +1,30 @@
 """
 Classify Instagram posts (event vs not) and extract structured fields via Google Gemini.
 
+By default reads posts from PostgreSQL (instagram_posts) and writes AI columns back to the same
+rows. Only posts from roughly the last AI_ANALYZE_RECENT_DAYS calendar days are considered (see
+constant in code). Use --use-temp-download for the legacy temp_download/<profile>/posts.json →
+posts_ai.json flow.
+
 Environment (set in .env in project root, or .env.gemini):
   GEMINI_API_KEY or GOOGLE_API_KEY — required for the Gemini API.
   GEMINI_MODEL — optional; default gemini-2.5-flash (stable; 2.0 Flash is deprecated).
   GEMINI_MODEL_FALLBACK — optional comma-separated model ids tried after GEMINI_MODEL when
     429/free-tier quota is exhausted (default: see DEFAULT_MODEL_FALLBACK_CHAIN in code).
   GEMINI_DEFAULT_TZ — optional IANA zone for interpreting relative dates (default America/Los_Angeles).
+  DB_* — see Blueprint_db / docker-compose for Postgres (required for default DB mode).
 
 .env format: simple KEY=value lines (optional "export " prefix, # comments). A large
 python-dotenv-incompatible .env is parsed line-by-line here so you do not get hundreds
 of parse warnings. Put Gemini keys in .env.gemini if you prefer a tiny file.
 
 Usage:
-  python -m app.ai_analyze_service.ai_analyze
+  python -m app.ai_analyze_service.ai_analyze --limit 3
+    # DB: all profiles with posts in the recent window
   python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --limit 3
-  python -m app.ai_analyze_service.ai_analyze --resume  # skip posts that already have ai in posts_ai.json
+  python -m app.ai_analyze_service.ai_analyze --profile seventhcollegestudentcouncil --resume
+    # skip rows that already have ai_model set
+  python -m app.ai_analyze_service.ai_analyze --use-temp-download --profile foo  # legacy JSON
 
 Model fallback chain (rate/quota):
   We start with GEMINI_MODEL. Each model gets up to several HTTP 429 retries; when that model’s
@@ -32,7 +41,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.error import HTTPError, URLError
@@ -46,9 +55,16 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 # Repo root (…/playwright-Playground); file is app/ai_analyze_service/ai_analyze.py
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-# Scraper output now lives in PostgreSQL (instagram_posts). This CLI still expects
-# temp_download/<profile>/posts.json; point it at legacy exports or migrate it to read rows from the DB.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 TEMP_DOWNLOAD = PROJECT_ROOT / "temp_download"
+
+_POST_DESC_MIN_WORDS = 50
+_POST_DESC_MAX_WORDS = 200
+
+# DB mode: only analyze posts whose post time falls within this many days of now (UTC).
+AI_ANALYZE_RECENT_DAYS = 50
 
 
 def _parse_env_file(path: Path) -> None:
@@ -86,6 +102,9 @@ def _load_env() -> None:
 
 
 _load_env()
+
+from Blueprint_db import InstagramPosts, SessionLocal  # noqa: E402
+from sqlalchemy import func, select, update  # noqa: E402
 
 # Stable model ids; see https://ai.google.dev/gemini-api/docs/models
 # Order: primary (GEMINI_MODEL) then these, deduped. All are commonly available on the free tier;
@@ -131,6 +150,8 @@ Rules:
   duration_minutes when you can compute it.
 - Times: use 24-hour fields in start/end (hour 0-23, minute 0-59). If only 12h text is given,
   convert and note ambiguity in raw_notes.
+- For non-events, description must be prose; for events, event_description must be prose.
+  Each must be 50–200 words (count whitespace-separated tokens), inclusive.
 """
 
 
@@ -145,6 +166,94 @@ class DateTimeParts(BaseModel):
     timezone: Optional[str] = None
     timezone_iana: Optional[str] = None
     assumptions_note: Optional[str] = None
+
+
+def _word_count(text: str) -> int:
+    """Count whitespace-delimited tokens (Gemini word targets)."""
+    return len(re.findall(r"\S+", (text or "").strip()))
+
+
+def _truncate_to_max_words(text: str, max_words: int) -> str:
+    words = re.findall(r"\S+", (text or "").strip())
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words])
+
+
+def _post_description_source_text(ai: PostAnalysisAI) -> str:
+    if ai.is_event:
+        return (ai.event_description or "").strip()
+    return (ai.description or "").strip()
+
+
+def _post_description_for_db(ai: PostAnalysisAI) -> str:
+    """Persisted post_description: at most _POST_DESC_MAX_WORDS (validator enforces minimum on ingest)."""
+    return _truncate_to_max_words(_post_description_source_text(ai), _POST_DESC_MAX_WORDS)
+
+
+def _zone_for_datetime_parts(parts: DateTimeParts, default_tz: ZoneInfo) -> ZoneInfo:
+    iana = (parts.timezone_iana or "").strip()
+    if iana:
+        try:
+            return ZoneInfo(iana)
+        except ZoneInfoNotFoundError:
+            pass
+    tz_hint = (parts.timezone or "").strip()
+    if tz_hint and "/" in tz_hint:
+        try:
+            return ZoneInfo(tz_hint)
+        except ZoneInfoNotFoundError:
+            pass
+    return default_tz
+
+
+def _datetime_from_parts(
+    parts: DateTimeParts | None,
+    default_tz: ZoneInfo,
+) -> datetime | None:
+    """Full calendar date required (y/m/d); hour/minute default to 0. No invented year."""
+    if parts is None:
+        return None
+    y, mo, d = parts.year, parts.month, parts.day
+    if y is None or mo is None or d is None:
+        return None
+    h = 0 if parts.hour is None else int(parts.hour)
+    mi = 0 if parts.minute is None else int(parts.minute)
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    try:
+        z = _zone_for_datetime_parts(parts, default_tz)
+        return datetime(y, mo, d, h, mi, tzinfo=z)
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def build_analyzer_post_dict(row: InstagramPosts) -> dict[str, Any]:
+    """Map an instagram_posts row to the dict shape expected by _user_prompt / _image_urls_from_post."""
+    comments: list[Any] = []
+    cj = row.comments_json
+    if isinstance(cj, dict):
+        raw = cj.get("comments")
+        if isinstance(raw, list):
+            comments = raw
+    omu: dict[str, Any] | list[Any] | None = row.additional_image_urls
+    if not isinstance(omu, dict):
+        omu = {}
+    taken: int | None = None
+    if row.posted_unix_seconds is not None:
+        try:
+            taken = int(row.posted_unix_seconds)
+        except (TypeError, ValueError):
+            taken = None
+    return {
+        "shortcode": row.post_shortcode,
+        "permalink": row.post_url,
+        "title": row.post_title or "",
+        "taken_at": taken,
+        "from_username": row.profile_username,
+        "comments": comments,
+        "openable_media_urls": omu,
+    }
 
 
 class PostAnalysisAI(BaseModel):
@@ -175,10 +284,44 @@ class PostAnalysisAI(BaseModel):
                 raise ValueError("event_title is required when is_event is true")
             if not (self.provider_name or "").strip():
                 raise ValueError("provider_name is required when is_event is true")
+            body = (self.event_description or "").strip()
+            if not body:
+                raise ValueError("event_description is required when is_event is true")
+            wc = _word_count(body)
+            if wc < _POST_DESC_MIN_WORDS or wc > _POST_DESC_MAX_WORDS:
+                raise ValueError(
+                    f"event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words "
+                    f"(got {wc})"
+                )
         else:
-            if not (self.description or "").strip():
+            body = (self.description or "").strip()
+            if not body:
                 raise ValueError("description is required when is_event is false")
+            wc = _word_count(body)
+            if wc < _POST_DESC_MIN_WORDS or wc > _POST_DESC_MAX_WORDS:
+                raise ValueError(
+                    f"description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words "
+                    f"(got {wc})"
+                )
         return self
+
+
+def _ai_to_db_update_values(ai: PostAnalysisAI, default_tz: ZoneInfo) -> dict[str, Any]:
+    start_at = _datetime_from_parts(ai.start, default_tz) if ai.is_event else None
+    end_at = _datetime_from_parts(ai.end, default_tz) if ai.is_event else None
+    return {
+        "is_event": ai.is_event,
+        "event_title": (ai.event_title or "").strip() if ai.is_event else None,
+        "provider_name": (ai.provider_name or "").strip() if ai.is_event else None,
+        "post_description": _post_description_for_db(ai),
+        "duration_in_minutes": ai.duration_minutes,
+        "confidence": ai.confidence,
+        "ai_model": ai.gemini_model,
+        "event_start_at": start_at,
+        "event_end_at": end_at,
+        "main_image_url": ai.main_image_url,
+        "updated_at": func.now(),
+    }
 
 
 def _gemini_api_key() -> str:
@@ -365,7 +508,7 @@ def _user_prompt(
         if num_images
         else "No images could be loaded; use title and comments text only."
     )
-    schema = """
+    schema = f"""
 Respond with JSON only, with these keys:
 - is_event (boolean)
 If is_event is true:
@@ -375,9 +518,11 @@ If is_event is true:
   - end (object or null): same shape as start; null if unknown
   - duration (string or null): e.g. "7:00 PM – 9:00 PM"
   - duration_minutes (integer or null)
-  - event_description (string or null): short summary of the activity
+  - event_description (string): prose summary of the activity for a student feed;
+    must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words inclusive (count words as whitespace-separated tokens).
 If is_event is false:
-  - description (string): what this post is about
+  - description (string): what this post is about;
+    must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words inclusive (count words as whitespace-separated tokens).
 Always include when possible:
   - confidence: "low" | "medium" | "high"
   - raw_notes (string or null): ambiguities or missing info
@@ -574,7 +719,11 @@ def _analyze_post(
             fix = (
                 ""
                 if attempt == 0
-                else "\n\nYour previous output was invalid. Output only valid JSON matching the schema."
+                else (
+                    "\n\nYour previous output was invalid. Output only valid JSON matching the schema. "
+                    f"If is_event is false, description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words; "
+                    f"if true, event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words."
+                )
             )
             contents = [*image_parts, base_prompt + fix]
             try:
@@ -686,6 +835,116 @@ def _load_existing_ai_by_shortcode(path: Path) -> dict[str, dict[str, Any]]:
     return m
 
 
+def _posted_at_coalesce_utc():
+    """posted_time if set, else Unix epoch as timestamptz UTC (for recency filter)."""
+    return func.coalesce(
+        InstagramPosts.posted_time,
+        func.timezone("UTC", func.to_timestamp(InstagramPosts.posted_unix_seconds)),
+    )
+
+
+def _fetch_instagram_rows_for_profile(
+    profile_username: str,
+    *,
+    resume: bool,
+) -> list[InstagramPosts]:
+    pn = profile_username.lstrip("@").strip()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=AI_ANALYZE_RECENT_DAYS)
+    stmt = select(InstagramPosts).where(InstagramPosts.profile_username == pn)
+    stmt = stmt.where(_posted_at_coalesce_utc() >= cutoff)
+    if resume:
+        stmt = stmt.where(InstagramPosts.ai_model.is_(None))
+    stmt = stmt.order_by(
+        InstagramPosts.posted_time.desc().nulls_last(),
+        InstagramPosts.posted_unix_seconds.desc().nulls_last(),
+        InstagramPosts.id.desc(),
+    )
+    with SessionLocal() as session:
+        rows = session.execute(stmt).scalars().all()
+    return list(rows)
+
+
+def _distinct_profile_usernames_recent() -> list[str]:
+    """Profiles that have at least one instagram_posts row in the recent-days window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=AI_ANALYZE_RECENT_DAYS)
+    stmt = (
+        select(InstagramPosts.profile_username)
+        .where(_posted_at_coalesce_utc() >= cutoff)
+        .distinct()
+        .order_by(InstagramPosts.profile_username)
+    )
+    with SessionLocal() as session:
+        rows = session.execute(stmt).all()
+    out: list[str] = []
+    for r in rows:
+        if r[0] and str(r[0]).strip():
+            out.append(str(r[0]).strip())
+    return out
+
+
+def process_profile_db(
+    profile_username: str,
+    *,
+    client: genai.Client,
+    model_chain: list[str],
+    tz: ZoneInfo,
+    limit: int | None,
+    resume: bool,
+    sleep_s: float,
+    chain_start_idx: int = 0,
+) -> int:
+    """Load rows from instagram_posts, run Gemini, UPDATE AI columns. Skips DB writes on errors."""
+    pn = profile_username.lstrip("@").strip()
+    rows = _fetch_instagram_rows_for_profile(pn, resume=resume)
+    if not rows:
+        parts = [
+            f"No rows for profile {pn!r}",
+            f"posted within the last {AI_ANALYZE_RECENT_DAYS} days",
+        ]
+        if resume:
+            parts.append("with ai_model IS NULL")
+        print(" ".join(parts), file=sys.stderr)
+        return chain_start_idx
+
+    analyzed = 0
+    chain_offset = chain_start_idx
+
+    for row in rows:
+        if limit is not None and analyzed >= limit:
+            break
+        post = build_analyzer_post_dict(row)
+        sc = post.get("shortcode")
+        try:
+            ai, used_idx = _analyze_post(
+                client, model_chain, post, tz, start_idx=chain_offset
+            )
+            chain_offset = used_idx
+            vals = _ai_to_db_update_values(ai, tz)
+            with SessionLocal() as session:
+                session.execute(
+                    update(InstagramPosts)
+                    .where(
+                        InstagramPosts.profile_username == pn,
+                        InstagramPosts.post_shortcode == row.post_shortcode,
+                    )
+                    .values(**vals)
+                )
+                session.commit()
+            analyzed += 1
+            sc_str = sc if isinstance(sc, str) else "?"
+            print(_format_ai_terminal_summary(sc_str, ai))
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+        except Exception as e:
+            brief = _format_analysis_error(e)
+            print(f"  Error {sc}: {brief}", file=sys.stderr)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+    print(f"DB profile {pn}: updated {analyzed} post(s)")
+    return chain_offset
+
+
 def process_profile_dir(
     clean_dir: Path,
     *,
@@ -763,21 +1022,36 @@ def process_profile_dir(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze Instagram posts.json with Gemini.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze Instagram posts with Gemini (default: PostgreSQL instagram_posts). "
+            f"DB mode only loads posts from roughly the last {AI_ANALYZE_RECENT_DAYS} days (UTC). "
+            "If --profile is omitted, every profile with at least one recent row is processed."
+        )
+    )
     parser.add_argument(
         "--profile",
-        help="Only process temp_download/<profile>/ (default: all profiles with posts.json)",
+        help=(
+            "Profile username. DB mode: optional; if omitted, all profiles with recent posts are "
+            f"processed. Legacy: temp_download/<profile>/ (omit to scan all dirs with posts.json). "
+            f"DB mode only loads posts from roughly the last {AI_ANALYZE_RECENT_DAYS} days."
+        ),
+    )
+    parser.add_argument(
+        "--use-temp-download",
+        action="store_true",
+        help="Read posts.json / write posts_ai.json under temp_download/ instead of the database",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Analyze at most this many posts per profile (others copied without new ai)",
+        help="Analyze at most this many posts per profile (DB: rows after ordering; legacy: others copied as-is)",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reuse existing posts_ai.json ai blocks by shortcode; only analyze missing",
+        help="DB: only rows where ai_model IS NULL. Legacy: reuse posts_ai.json ai blocks by shortcode",
     )
     parser.add_argument(
         "--sleep",
@@ -797,23 +1071,52 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    if args.profile:
-        dirs = [TEMP_DOWNLOAD / args.profile.strip().lstrip("@")]
-        if not (dirs[0] / "posts.json").is_file():
-            print(f"No posts.json at {dirs[0]}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        dirs = _discover_profiles(TEMP_DOWNLOAD)
+    if args.use_temp_download:
+        if args.profile:
+            dirs = [TEMP_DOWNLOAD / args.profile.strip().lstrip("@")]
+            if not (dirs[0] / "posts.json").is_file():
+                print(f"No posts.json at {dirs[0]}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            dirs = _discover_profiles(TEMP_DOWNLOAD)
 
-    if not dirs:
-        print(f"No profiles with posts.json under {TEMP_DOWNLOAD}", file=sys.stderr)
-        sys.exit(1)
+        if not dirs:
+            print(f"No profiles with posts.json under {TEMP_DOWNLOAD}", file=sys.stderr)
+            sys.exit(1)
+
+        chain_offset = 0
+        for d in dirs:
+            print(f"Profile: {d.name}")
+            chain_offset = process_profile_dir(
+                d,
+                client=client,
+                model_chain=model_chain,
+                tz=tz,
+                limit=args.limit,
+                resume=args.resume,
+                sleep_s=args.sleep,
+                chain_start_idx=chain_offset,
+            )
+        return
+
+    if args.profile and args.profile.strip():
+        profile_list = [args.profile.strip().lstrip("@")]
+    else:
+        profile_list = _distinct_profile_usernames_recent()
+        if not profile_list:
+            print(
+                "DB mode: no profiles found with posts in the recent window "
+                f"(last {AI_ANALYZE_RECENT_DAYS} days). "
+                "Scrape first, widen the window (AI_ANALYZE_RECENT_DAYS in code), or pass --profile.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     chain_offset = 0
-    for d in dirs:
-        print(f"Profile: {d.name}")
-        chain_offset = process_profile_dir(
-            d,
+    for pn in profile_list:
+        print(f"Profile: {pn}")
+        chain_offset = process_profile_db(
+            pn,
             client=client,
             model_chain=model_chain,
             tz=tz,
