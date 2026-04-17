@@ -1,0 +1,5 @@
+  seventhcollegestudentcouncil: graphql bodies × 2 → postgres rows upserted × 24, posts in bundle × 24, cdn urls × 602 (60 largest / 542 other), early_exit overlap=23
+  ttv.ucsd: graphql bodies × 2 → postgres rows upserted × 23, posts in bundle × 23, cdn urls × 1197 (99 largest / 1098 other), early_exit overlap=19
+  rco.ucsd: graphql bodies × 2 → postgres rows upserted × 24, posts in bundle × 24, cdn urls × 440 (35 largest / 405 other), early_exit overlap=21
+  animeclubatucsd: graphql bodies × 2 → postgres rows upserted × 24, posts in bundle × 24, cdn urls × 406 (41 largest / 365 other), early_exit overlap=24
+  eighthcollegecouncil: not found in Following list after 20 scrolls, skipping.

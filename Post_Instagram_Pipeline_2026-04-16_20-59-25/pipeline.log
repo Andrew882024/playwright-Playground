@@ -1,0 +1,8 @@
+  keebsatucsd: graphql bodies × 2 → postgres rows upserted × 24, posts in bundle × 24, cdn urls × 460 (71 largest / 389 other), early_exit overlap=19
+  envisionucsd: graphql bodies × 6 → postgres rows upserted × 72, posts in bundle × 72, cdn urls × 1112 (129 largest / 983 other), scrolls=10 (no early exit)
+  dvcatucsd: graphql bodies × 6 → postgres rows upserted × 72, posts in bundle × 72, cdn urls × 1741 (224 largest / 1517 other), scrolls=10 (no early exit)
+  ucsdasce: graphql bodies × 6 → postgres rows upserted × 71, posts in bundle × 71, cdn urls × 2298 (331 largest / 1967 other), scrolls=10 (no early exit)
+  ucsdcenters: graphql bodies × 6 → postgres rows upserted × 72, posts in bundle × 72, cdn urls × 1938 (294 largest / 1644 other), scrolls=10 (no early exit)
+Screenshot saved to /Users/andrewzhang/Desktop/playwright-Playground/test_Instagram/instagram_page.png
+usage: __main__.py [-h] [--profile PROFILE] [--use-temp-download] [--limit LIMIT] [--resume] [--sleep SLEEP]
+__main__.py: error: unrecognized arguments: app.main:app --host 0.0.0.0 --port 8001 --reload
