@@ -1,8 +1,8 @@
 """
 Open Instagram in Playwright using instagram_cookies_firefox.json (see translate_instagram_cookie_into_playwright_version.py).
 
-Reads ``TARGET_URLS`` (and optional ``PROFILE_USERNAME``) from tempdata.py: each handle or URL is
-opened in turn, scrolled to collect timeline GraphQL, and posts are upserted into PostgreSQL
+Reads ``TARGET_URLS`` from tempdata.py: each bare username is opened in turn, scrolled to collect
+timeline GraphQL, and posts are upserted into PostgreSQL
 (``instagram_posts``). GraphQL is kept in
 memory only (no temp_download / temp_download_raw).
 
@@ -41,7 +41,7 @@ from translate_instagram_cookie_into_playwright_version import (  # noqa: E402
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from scrape_db import known_shortcodes_for_profile, upsert_posts_for_profile  # noqa: E402
-from tempdata import PROFILE_USERNAME, TARGET_URLS  # noqa: E402
+from tempdata import TARGET_URLS  # noqa: E402
 
 SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
 # Same folder each run = Firefox remembers cookies, localStorage, and notification permission for the origin.
@@ -52,65 +52,6 @@ INSTAGRAM_ORIGIN = "https://www.instagram.com"
 # Early-exit profile scroll: stop when len(known ∩ this_run) > OVERLAP_STOP_THRESHOLD (e.g. 3+ matches).
 OVERLAP_STOP_THRESHOLD = 2
 MAX_PROFILE_SCROLLS = 10
-
-# First URL path segment on instagram.com that is not a profile username (lowercase).
-_IG_PATH_NOT_USERNAME = frozenset(
-    {
-        "p",
-        "reel",
-        "reels",
-        "stories",
-        "explore",
-        "accounts",
-        "tv",
-        "direct",
-        "legal",
-        "about",
-        "developer",
-        "privacy",
-        "terms",
-        "static",
-        "api",
-        "graphql",
-        "help",
-        "press",
-        "download",
-        "404",
-        "directory",
-        "emails",
-    }
-)
-
-
-def _resolve_profile_username(target_url: str, explicit: str | None) -> str | None:
-    """DB profile key: first non-reserved path segment, else optional ``explicit`` from tempdata."""
-    path = urlparse(target_url).path.strip("/")
-    if path:
-        first = path.split("/")[0]
-        if first and first.lower() not in _IG_PATH_NOT_USERNAME:
-            return first
-    if explicit is not None:
-        s = str(explicit).lstrip("@").strip()
-        if s:
-            return s
-    return None
-
-
-def _normalize_target_to_url(entry: str) -> str:
-    """Bare handle → profile URL; already-absolute URLs pass through (with https if missing)."""
-    e = str(entry).strip()
-    if not e:
-        raise ValueError("empty target entry")
-    low = e.lower()
-    if low.startswith("http://") or low.startswith("https://"):
-        return e
-    if "instagram.com" in low:
-        return e if low.startswith("http") else f"https://{e.lstrip('/')}"
-    u = e.lstrip("@").split("/")[0].strip()
-    if not u:
-        raise ValueError("empty handle")
-    return f"{INSTAGRAM_ORIGIN}/{u}/"
-
 
 # Substrings that suggest this GraphQL JSON carries posts / media / comments (not inbox tray, etc.).
 _POST_GRAPHQL_MARKERS = (
@@ -797,12 +738,6 @@ def _scroll_profile_capture_and_upsert(page, profile_username: str) -> None:
     )
 
 
-def _scroll_profile_down(page, times: int) -> None:
-    """Each scroll: 70–100% of viewport (not tiny chunks), one motion with slow→fast→slow easing."""
-    for _ in range(times):
-        _scroll_profile_down_once(page)
-
-
 def _dismiss_instagram_notification_prompt_if_present(page) -> None:
     """Click Not Now or Turn On when the sheet is visible so Instagram stores it in this profile."""
     choice = page.get_by_role("button", name="Not Now").or_(
@@ -834,26 +769,13 @@ def main() -> None:
         context.add_cookies(cookies)
         page = context.new_page()
         screenshot_paths: list[Path] = []
-        for raw in TARGET_URLS:
-            try:
-                target_url = _normalize_target_to_url(raw)
-            except ValueError as err:
-                print(f"  skip {raw!r}: {err}", file=sys.stderr)
-                continue
-            profile_user = _resolve_profile_username(target_url, PROFILE_USERNAME)
-            if not profile_user:
-                print(
-                    f"  skip {raw!r}: could not resolve DB profile username "
-                    f"(set PROFILE_USERNAME in tempdata.py or use a profile URL).",
-                    file=sys.stderr,
-                )
-                continue
+        for profile_user in TARGET_URLS:
+            target_url = f"{INSTAGRAM_ORIGIN}/{profile_user}/"
             page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(3000)
             _dismiss_instagram_notification_prompt_if_present(page)
             _scroll_profile_capture_and_upsert(page, profile_user)
-            safe = re.sub(r"[^\w.-]+", "_", profile_user) or "page"
-            out_path = SCREENSHOT_DIR / f"instagram_{safe}.png"
+            out_path = SCREENSHOT_DIR / f"instagram_{profile_user}.png"
             page.screenshot(path=str(out_path), full_page=True)
             screenshot_paths.append(out_path)
         context.close()
