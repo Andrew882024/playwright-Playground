@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
 from app.add_our_own_s3_url.add_our_own_s3_url import main as run_add_our_own_s3_url
-from app.ai_analyze_service.ai_analyze import main as run_ai_analyze
+from app.ai_analyze_service.ai_analyze import main as ai_analyze_main
 from app.instagram_scraper.sync_ins import main as run_instagram_scraper
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -51,7 +51,7 @@ def post_instagram_pipeline() -> dict[str, object]:
     with log_path.open("w", encoding="utf-8") as log_file:
         with redirect_stdout(log_file), redirect_stderr(log_file):
             _run_step("run_instagram_scraper", run_instagram_scraper)
-            _run_step("ai_analyze", run_ai_analyze)
+            _run_step("ai_analyze", lambda: ai_analyze_main([]))
             _run_step("add_our_own_s3_url", run_add_our_own_s3_url)
     return {
         "success": True,
