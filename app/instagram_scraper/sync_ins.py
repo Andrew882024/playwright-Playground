@@ -1,8 +1,10 @@
 """
 Open Instagram in Playwright using instagram_cookies_firefox.json (see translate_instagram_cookie_into_playwright_version.py).
 
-Visits each account in tempdata.py via the Following modal, scrolls the profile, and upserts posts into
-PostgreSQL (instagram_posts). GraphQL responses are held in memory only (no temp_download / temp_download_raw).
+Reads ``TARGET_URLS`` (and optional ``PROFILE_USERNAME``) from tempdata.py: each handle or URL is
+opened in turn, scrolled to collect timeline GraphQL, and posts are upserted into PostgreSQL
+(``instagram_posts``). GraphQL is kept in
+memory only (no temp_download / temp_download_raw).
 
 Each post's openable_media_urls in the structured bundle is {"largest": [...], "other": [...]} —
 only URLs from the post's own media (not profile/avatar images from user or comment objects).
@@ -34,14 +36,12 @@ if str(_APP_DIR) not in sys.path:
 from translate_instagram_cookie_into_playwright_version import (  # noqa: E402
     PROJECT_ROOT,
     load_instagram_cookies_for_playwright,
-    read_instagram_profile_username,
-    read_instagram_target_url,
 )
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from scrape_db import known_shortcodes_for_profile, upsert_posts_for_profile  # noqa: E402
-from tempdata import following_usernames  # noqa: E402
+from tempdata import PROFILE_USERNAME, TARGET_URLS  # noqa: E402
 
 SCREENSHOT_DIR = PROJECT_ROOT / "test_Instagram"
 # Same folder each run = Firefox remembers cookies, localStorage, and notification permission for the origin.
@@ -53,8 +53,64 @@ INSTAGRAM_ORIGIN = "https://www.instagram.com"
 OVERLAP_STOP_THRESHOLD = 2
 MAX_PROFILE_SCROLLS = 10
 
-# Following modal: scroll down to search for a username row; max scrolls before skipping that target.
-MAX_FOLLOWING_MODAL_SCROLLS = 20
+# First URL path segment on instagram.com that is not a profile username (lowercase).
+_IG_PATH_NOT_USERNAME = frozenset(
+    {
+        "p",
+        "reel",
+        "reels",
+        "stories",
+        "explore",
+        "accounts",
+        "tv",
+        "direct",
+        "legal",
+        "about",
+        "developer",
+        "privacy",
+        "terms",
+        "static",
+        "api",
+        "graphql",
+        "help",
+        "press",
+        "download",
+        "404",
+        "directory",
+        "emails",
+    }
+)
+
+
+def _resolve_profile_username(target_url: str, explicit: str | None) -> str | None:
+    """DB profile key: first non-reserved path segment, else optional ``explicit`` from tempdata."""
+    path = urlparse(target_url).path.strip("/")
+    if path:
+        first = path.split("/")[0]
+        if first and first.lower() not in _IG_PATH_NOT_USERNAME:
+            return first
+    if explicit is not None:
+        s = str(explicit).lstrip("@").strip()
+        if s:
+            return s
+    return None
+
+
+def _normalize_target_to_url(entry: str) -> str:
+    """Bare handle → profile URL; already-absolute URLs pass through (with https if missing)."""
+    e = str(entry).strip()
+    if not e:
+        raise ValueError("empty target entry")
+    low = e.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return e
+    if "instagram.com" in low:
+        return e if low.startswith("http") else f"https://{e.lstrip('/')}"
+    u = e.lstrip("@").split("/")[0].strip()
+    if not u:
+        raise ValueError("empty handle")
+    return f"{INSTAGRAM_ORIGIN}/{u}/"
+
 
 # Substrings that suggest this GraphQL JSON carries posts / media / comments (not inbox tray, etc.).
 _POST_GRAPHQL_MARKERS = (
@@ -654,172 +710,6 @@ def _make_graphql_posts_capture(
     return on_response, finalize
 
 
-def _open_profile(page, username: str) -> None:
-    """Click the sidebar/header profile link; if it is not found, open the profile URL."""
-    u = username.lstrip("@").strip()
-    profile = f"{INSTAGRAM_ORIGIN}/{u}/"
-    try:
-        page.locator(f'a[href="/{u}/"]').first.click(timeout=15_000)
-        page.wait_for_url(lambda url: f"/{u}/" in url, timeout=20_000)
-    except Exception:
-        page.goto(profile, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(1500)
-
-
-def _open_following_list(page, profile_username: str) -> None:
-    """Open the Following list modal from the given account's profile page.
-
-    After visiting another profile, the browser may not be on ``profile_username``'s page, so we
-    always navigate to ``/{profile_username}/`` first, then click Following (several fallbacks).
-    """
-    u = profile_username.lstrip("@").strip()
-    profile_home = f"{INSTAGRAM_ORIGIN}/{u}/"
-    page.goto(profile_home, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(1500)
-    _dismiss_instagram_notification_prompt_if_present(page)
-
-    opened = False
-    try:
-        page.locator(f'a[href="/{u}/following/"]').first.click(timeout=12_000)
-        opened = True
-    except Exception:
-        pass
-    if not opened:
-        try:
-            page.locator('a[href*="/following"]').first.click(timeout=12_000)
-            opened = True
-        except Exception:
-            pass
-    if not opened:
-        try:
-            page.get_by_role("link", name=re.compile(r"following", re.I)).first.click(timeout=12_000)
-            opened = True
-        except Exception:
-            pass
-    if not opened:
-        try:
-            page.locator("span").filter(has_text=re.compile(r"following", re.I)).first.click(timeout=10_000)
-            opened = True
-        except Exception:
-            pass
-    if not opened:
-        try:
-            page.get_by_text(re.compile(r"^\s*following\s*$", re.I)).first.click(timeout=8_000)
-            opened = True
-        except Exception:
-            pass
-    if not opened:
-        raise RuntimeError(
-            f"Could not open Following list from profile {u!r}. "
-            "Check that the stats row is visible or the UI changed."
-        )
-
-    page.wait_for_timeout(1500)
-    try:
-        page.locator('[role="dialog"]').first.wait_for(state="visible", timeout=10_000)
-    except Exception:
-        pass
-
-
-def _scroll_following_modal_once(page, dialog) -> None:
-    """Scroll the Following list inside the dialog (not the main window)."""
-    dialog.evaluate(
-        """(root) => {
-          function findScrollable(el, depth) {
-            if (!el || depth > 16) return null;
-            const st = window.getComputedStyle(el);
-            const oy = st.overflowY;
-            if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 24) {
-              return el;
-            }
-            for (let i = 0; i < el.children.length; i++) {
-              const f = findScrollable(el.children[i], depth + 1);
-              if (f) return f;
-            }
-            return null;
-          }
-          const sc = findScrollable(root, 0) || root;
-          const ch = sc.clientHeight || 400;
-          sc.scrollTop += Math.max(200, Math.floor(ch * 0.78));
-        }"""
-    )
-    page.wait_for_timeout(random.randint(350, 700))
-
-
-def _try_click_following_row_in_modal(page, dialog, username: str) -> bool:
-    """Find `a[href="/user/"]` in the Following modal, scrolling up to MAX_FOLLOWING_MODAL_SCROLLS times."""
-    u = username.lstrip("@").strip()
-    sel = f'a[href="/{u}/"]'
-    for attempt in range(MAX_FOLLOWING_MODAL_SCROLLS + 1):
-        rows = dialog.locator(sel)
-        try:
-            if rows.count() > 0:
-                row_link = rows.first
-                row_link.scroll_into_view_if_needed(timeout=10_000)
-                try:
-                    row_link.click(timeout=12_000)
-                except Exception:
-                    try:
-                        row_link.click(timeout=12_000, force=True)
-                    except Exception:
-                        row_link.evaluate("el => el.click()")
-                return True
-        except Exception:
-            pass
-        if attempt < MAX_FOLLOWING_MODAL_SCROLLS:
-            _scroll_following_modal_once(page, dialog)
-    return False
-
-
-def _open_following_profile(page, username: str) -> None:
-    """Click the account row inside the open Following modal (not a global .first link — sidebar can be disabled)."""
-    u = username.lstrip("@").strip()
-    known_shortcodes = known_shortcodes_for_profile(u)
-    bodies_this_run: list[str] = []
-    shortcodes_this_run: set[str] = set()
-    gql_handler, finalize = _make_graphql_posts_capture(bodies_this_run, shortcodes_this_run)
-    page.on("response", gql_handler)
-    scroll_stopped_early = False
-    overlap_at_stop = 0
-    try:
-        dialog = page.locator('[role="dialog"]').first
-        dialog.wait_for(state="visible", timeout=15_000)
-        # Only links inside the modal; scroll the list if the row is below the fold.
-        if not _try_click_following_row_in_modal(page, dialog, u):
-            print(
-                f"  {u}: not found in Following list after {MAX_FOLLOWING_MODAL_SCROLLS} scrolls, skipping.",
-                file=sys.stderr,
-            )
-            return
-        page.wait_for_url(lambda url: f"/{u}/" in url, timeout=25_000)
-        page.wait_for_timeout(1500)
-        for _ in range(MAX_PROFILE_SCROLLS):
-            _scroll_profile_down_once(page)
-            overlap_at_stop = len(known_shortcodes & shortcodes_this_run)
-            if overlap_at_stop > OVERLAP_STOP_THRESHOLD:
-                scroll_stopped_early = True
-                break
-    finally:
-        page.remove_listener("response", gql_handler)
-
-    urls, n_saved = finalize()
-    bundle = structured_bundle_from_graphql_bodies(bodies_this_run, u)
-    n_upserted = upsert_posts_for_profile(u, bundle["posts"])
-    organized_all = _organize_instagram_cdn_urls(urls)
-    n_flat = len(organized_all["largest"]) + len(organized_all["other"])
-    exit_note = (
-        f", early_exit overlap={overlap_at_stop}"
-        if scroll_stopped_early
-        else f", scrolls={MAX_PROFILE_SCROLLS} (no early exit)"
-    )
-    print(
-        f"  {u}: graphql bodies × {n_saved} → postgres rows upserted × {n_upserted}, "
-        f"posts in bundle × {len(bundle['posts'])}, cdn urls × {n_flat} "
-        f"({len(organized_all['largest'])} largest / {len(organized_all['other'])} other)"
-        f"{exit_note}"
-    )
-
-
 _ONE_HUMAN_SCROLL_JS = """
 async () => {
     const vh = window.innerHeight;
@@ -868,6 +758,45 @@ def _scroll_profile_down_once(page) -> None:
     page.wait_for_timeout(random.randint(900, 2_800))
 
 
+def _scroll_profile_capture_and_upsert(page, profile_username: str) -> None:
+    """After ``page`` is on the target URL, capture GraphQL while scrolling and upsert posts."""
+    u = profile_username.lstrip("@").strip()
+    known_shortcodes = known_shortcodes_for_profile(u)
+    bodies_this_run: list[str] = []
+    shortcodes_this_run: set[str] = set()
+    gql_handler, finalize = _make_graphql_posts_capture(bodies_this_run, shortcodes_this_run)
+    page.on("response", gql_handler)
+    scroll_stopped_early = False
+    overlap_at_stop = 0
+    try:
+        page.wait_for_timeout(1500)
+        for _ in range(MAX_PROFILE_SCROLLS):
+            _scroll_profile_down_once(page)
+            overlap_at_stop = len(known_shortcodes & shortcodes_this_run)
+            if overlap_at_stop > OVERLAP_STOP_THRESHOLD:
+                scroll_stopped_early = True
+                break
+    finally:
+        page.remove_listener("response", gql_handler)
+
+    urls, n_saved = finalize()
+    bundle = structured_bundle_from_graphql_bodies(bodies_this_run, u)
+    n_upserted = upsert_posts_for_profile(u, bundle["posts"])
+    organized_all = _organize_instagram_cdn_urls(urls)
+    n_flat = len(organized_all["largest"]) + len(organized_all["other"])
+    exit_note = (
+        f", early_exit overlap={overlap_at_stop}"
+        if scroll_stopped_early
+        else f", scrolls={MAX_PROFILE_SCROLLS} (no early exit)"
+    )
+    print(
+        f"  {u}: graphql bodies × {n_saved} → postgres rows upserted × {n_upserted}, "
+        f"posts in bundle × {len(bundle['posts'])}, cdn urls × {n_flat} "
+        f"({len(organized_all['largest'])} largest / {len(organized_all['other'])} other)"
+        f"{exit_note}"
+    )
+
+
 def _scroll_profile_down(page, times: int) -> None:
     """Each scroll: 70–100% of viewport (not tiny chunks), one motion with slow→fast→slow easing."""
     for _ in range(times):
@@ -888,11 +817,11 @@ def _dismiss_instagram_notification_prompt_if_present(page) -> None:
 
 def main() -> None:
     cookies = load_instagram_cookies_for_playwright()
-    target = read_instagram_target_url()
+    if not TARGET_URLS:
+        raise SystemExit("tempdata.TARGET_URLS is empty; add at least one handle or URL.")
 
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     PERSISTENT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = SCREENSHOT_DIR / "instagram_page.png"
 
     with sync_playwright() as p:
         context = p.firefox.launch_persistent_context(
@@ -904,28 +833,33 @@ def main() -> None:
         context.grant_permissions(["notifications"], origin=INSTAGRAM_ORIGIN)
         context.add_cookies(cookies)
         page = context.new_page()
-        page.goto(target, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(3000)
-        _dismiss_instagram_notification_prompt_if_present(page)
-        profile_user = read_instagram_profile_username()
-        if profile_user:
-            _open_profile(page, profile_user)
-            for username in following_usernames:
-                _open_following_list(page, profile_user)
-                _open_following_profile(page, username)
-                try:
-                    page.go_back(wait_until="domcontentloaded", timeout=25_000)
-                except Exception:
-                    page.goto(
-                        f"{INSTAGRAM_ORIGIN}/{profile_user.lstrip('@').strip()}/",
-                        wait_until="domcontentloaded",
-                        timeout=60_000,
-                    )
-                page.wait_for_timeout(500)
-        page.screenshot(path=str(out_path), full_page=True)
+        screenshot_paths: list[Path] = []
+        for raw in TARGET_URLS:
+            try:
+                target_url = _normalize_target_to_url(raw)
+            except ValueError as err:
+                print(f"  skip {raw!r}: {err}", file=sys.stderr)
+                continue
+            profile_user = _resolve_profile_username(target_url, PROFILE_USERNAME)
+            if not profile_user:
+                print(
+                    f"  skip {raw!r}: could not resolve DB profile username "
+                    f"(set PROFILE_USERNAME in tempdata.py or use a profile URL).",
+                    file=sys.stderr,
+                )
+                continue
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(3000)
+            _dismiss_instagram_notification_prompt_if_present(page)
+            _scroll_profile_capture_and_upsert(page, profile_user)
+            safe = re.sub(r"[^\w.-]+", "_", profile_user) or "page"
+            out_path = SCREENSHOT_DIR / f"instagram_{safe}.png"
+            page.screenshot(path=str(out_path), full_page=True)
+            screenshot_paths.append(out_path)
         context.close()
 
-    print(f"Screenshot saved to {out_path}")
+    for pth in screenshot_paths:
+        print(f"Screenshot saved to {pth}")
 
 
 if __name__ == "__main__":

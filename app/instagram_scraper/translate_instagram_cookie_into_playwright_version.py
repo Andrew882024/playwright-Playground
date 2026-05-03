@@ -1,9 +1,8 @@
-"""Firefox Instagram cookie export at repo root → Playwright cookies. See sync_ins.py."""
+"""Firefox Instagram cookie export at repo root → Playwright cookies (PROJECT_ROOT, load helper)."""
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -60,12 +59,3 @@ def load_instagram_cookies_for_playwright() -> list[dict]:
     if not out:
         raise SystemExit(f"No cookies parsed from {_COOKIES.name}.")
     return out
-
-
-def read_instagram_target_url() -> str:
-    return "https://www.instagram.com/"
-
-
-def read_instagram_profile_username() -> str | None:
-    u = os.environ.get("INSTAGRAM_PROFILE_USERNAME", "").strip().lstrip("@")
-    return u or None
