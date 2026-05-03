@@ -767,7 +767,10 @@ def main() -> None:
         )
         context.grant_permissions(["notifications"], origin=INSTAGRAM_ORIGIN)
         context.add_cookies(cookies)
-        page = context.new_page()
+        # Persistent Firefox already has one startup tab; new_page() would add a second ("Opening 2").
+        while len(context.pages) > 1:
+            context.pages[-1].close()
+        page = context.pages[0] if context.pages else context.new_page()
         screenshot_paths: list[Path] = []
         for profile_user in TARGET_URLS:
             target_url = f"{INSTAGRAM_ORIGIN}/{profile_user}/"
