@@ -699,8 +699,15 @@ def _scroll_profile_down_once(page) -> None:
     page.wait_for_timeout(random.randint(900, 2_800))
 
 
-def _scroll_profile_capture_and_upsert(page, profile_username: str) -> None:
-    """After ``page`` is on the target URL, capture GraphQL while scrolling and upsert posts."""
+def _scroll_profile_capture_and_upsert(
+    page, profile_username: str, profile_url: str
+) -> None:
+    """Navigate to ``profile_url``, capture timeline GraphQL (including the first in-flight batch),
+    scroll, and upsert posts.
+
+    The ``response`` listener must be registered *before* ``page.goto`` so the initial
+    profile-load GraphQL responses are not dropped.
+    """
     u = profile_username.lstrip("@").strip()
     known_shortcodes = known_shortcodes_for_profile(u)
     bodies_this_run: list[str] = []
@@ -710,6 +717,9 @@ def _scroll_profile_capture_and_upsert(page, profile_username: str) -> None:
     scroll_stopped_early = False
     overlap_at_stop = 0
     try:
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(3000)
+        _dismiss_instagram_notification_prompt_if_present(page)
         page.wait_for_timeout(1500)
         for _ in range(MAX_PROFILE_SCROLLS):
             _scroll_profile_down_once(page)
@@ -774,10 +784,7 @@ def main() -> None:
         screenshot_paths: list[Path] = []
         for profile_user in TARGET_URLS:
             target_url = f"{INSTAGRAM_ORIGIN}/{profile_user}/"
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(3000)
-            _dismiss_instagram_notification_prompt_if_present(page)
-            _scroll_profile_capture_and_upsert(page, profile_user)
+            _scroll_profile_capture_and_upsert(page, profile_user, target_url)
             out_path = SCREENSHOT_DIR / f"instagram_{profile_user}.png"
             page.screenshot(path=str(out_path), full_page=True)
             screenshot_paths.append(out_path)

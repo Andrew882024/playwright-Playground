@@ -1,5 +1,6 @@
 # Each entry: bare Instagram username (already valid). Opened, scrolled, upserted (sync_ins.py).
 TARGET_URLS = [
-    "keebsatucsd",
-    "ucsdcenters",
+    "keebsatucsd", 
+    "acm.at.ucsd",
+    "ucsdcenters","envisionucsd","dvcatucsd","ucsdasce","seventhcollegestudentcouncil","ttv.ucsd","rco.ucsd","animeclubatucsd","eighthcollegecouncil",
 ]
