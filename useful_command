@@ -1,5 +1,7 @@
 python app/instagram_scraper/sync_ins.py  
 python app/ai_analyze_service/ai_analyze.py
+python app/event_deduplication_module/deduplicate_events.py
 python app/add_our_own_s3_url/add_our_own_s3_url.py
+
 
 uvicorn app.main:app --reload --port 8001  

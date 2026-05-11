@@ -33,7 +33,7 @@ load_dotenv(_REPO_ROOT / ".env.gemini")
 from Blueprint_db import InstagramPosts, SessionLocal  # noqa: E402
 
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 
 
 def _gemini_api_key() -> str:
