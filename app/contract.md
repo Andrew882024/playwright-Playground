@@ -7,5 +7,6 @@ Current pipeline flow:
 
 1. Instagram Scraper Module
 2. AI Analyze Service Module
-3. Add Our Own S3 URL Module
-4. Fomo Sync Module (Triggered by API call)
+3. event_deduplication_module
+4. Add Our Own S3 URL Module
+5. Fomo Sync Module (Triggered by API call)

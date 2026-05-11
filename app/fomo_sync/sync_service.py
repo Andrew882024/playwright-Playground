@@ -46,6 +46,7 @@ def instagram_post_row_to_dict(row: InstagramPosts) -> dict[str, Any]:
         "ai_model": row.ai_model,
         "ai_analyzed": row.ai_analyzed,
         "event_start_at": _dt_iso(row.event_start_at),
+        "is_duplicated": row.is_duplicated,
         "event_end_at": _dt_iso(row.event_end_at),
         "own_s3_url_for_main_image": row.own_s3_url_for_main_image,
         "created_at": _dt_iso(row.created_at),
