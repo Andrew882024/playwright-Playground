@@ -1,0 +1,1 @@
+We need to add a column named is_duplicated in instagram_posts table, this column is boolean, nullable
