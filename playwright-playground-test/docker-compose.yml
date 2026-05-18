@@ -1,0 +1,58 @@
+# --- Quick reference (run from this repo root) ---
+#
+# Bring Postgres + Redis up (detached):
+#   docker compose up -d
+#   docker compose --project-directory playwright-playground-test up -d #test version
+#
+# Stop and remove containers (data in named volumes is kept):
+#   docker compose down
+#
+# Stop and remove containers + volumes (wipes Postgres and Redis data):
+#   docker compose down -v
+#
+# Postgres: port mapping is HOST:CONTAINER (default host 5439 → container 5432).
+# Connect from the host with DB_PORT / credentials from .env or defaults playground/playground.
+#
+#   psql "postgresql://${DB_USERNAME:-playground}:${DB_PASSWORD:-playground}@127.0.0.1:${DB_PORT:-5439}/${DB_DATABASE:-playground}"
+#
+# Redis (ai_analyze_service_mutithread): default host port 6379. From the host:
+#   REDIS_HOST=127.0.0.1 REDIS_PORT=6379
+#   redis-cli -h 127.0.0.1 -p ${REDIS_PORT:-6379} ping
+#
+services:
+  postgres:
+    # 17 is a solid current major; pin here for reproducible builds (bump when you upgrade).
+    image: postgres:17-alpine
+    container_name: playwright-playground-postgres-test
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-playground}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-playground}
+      POSTGRES_DB: ${DB_DATABASE:-playground}
+    ports:
+      # Host port defaults to 5440 so it does not clash with a local Postgres on 5432 (container still listens on 5432).
+      - "${DB_PORT:-5440}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playground -d playground"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: playwright-playground-redis-test
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
