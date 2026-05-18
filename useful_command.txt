@@ -5,3 +5,7 @@ python app/add_our_own_s3_url/add_our_own_s3_url.py
 
 
 uvicorn app.main:app --reload --port 8001  
+
+
+
+python app/ai_analyze_service_mutithread/ai_analyze_mt.py

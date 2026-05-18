@@ -8,13 +8,17 @@ the service in the floder is already working, I want to make it faster with muti
 
 the service first go to db to get all data that we need to proccess.
 
-the redis message queue assign works that each thread need to do.
-
 I want 4 threads, which each thread is related with one of these model:
 "gemini-3-flash-preview",
 "gemini-3.1-flash-lite-preview",
 "gemini-2.5-flash",
 "gemini-2.5-flash-lite",
+
+the redis message queue assign works that each thread need to do.
+
+we default run 4 workers
+
+4 workers will work at same time, each one will have tasks, not all on one worker.
 
 when one of them reach the limit and steal fail after retry, the message queue reassign the task
 

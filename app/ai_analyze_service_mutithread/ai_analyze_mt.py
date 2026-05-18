@@ -1,5 +1,9 @@
 """
-Multithreaded Gemini analysis: Redis queues per model, four worker threads.
+Multithreaded Gemini analysis: Redis queues per model.
+
+By default runs 4 worker threads in parallel (one per model queue). New jobs are
+spread round-robin across all four queues so each worker has tasks, not only the
+first model. Enqueues from DB, then workers process until all queues are empty.
 
 Run from repo root (Redis must be reachable; set REDIS_URL or REDIS_HOST/PORT):
   python -m app.ai_analyze_service_mutithread.ai_analyze_mt
@@ -16,7 +20,6 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,17 +87,18 @@ from app.ai_analyze_service_mutithread.gemini_analysis import (  # noqa: E402
     primary_image_url_from_post,
 )
 from app.ai_analyze_service_mutithread.redis_queue import (  # noqa: E402
+    DEFAULT_WORKER_COUNT,
     MODEL_QUEUE_CHAIN,
     AnalyzeJob,
     ack_job,
     claim_job,
     enqueue_job,
-    first_model_in_chain,
     flush_all_queues,
+    initial_model_for_job_index,
     queue_depths,
     reassign_job,
 )
-from app.ai_analyze_service_mutithread.redis_queue import _redis_client  # noqa: E402
+from app.ai_analyze_service_mutithread.redis_queue import redis_client  # noqa: E402
 
 
 def build_analyzer_post_dict(row: InstagramPosts) -> dict[str, Any]:
@@ -140,10 +144,10 @@ def enqueue_candidates_from_db(
     )
     if limit is not None:
         keys = keys[:limit]
-    first = first_model_in_chain()
     n = 0
-    for prof, sc in keys:
-        enqueue_job(r, first, AnalyzeJob(profile_username=prof, post_shortcode=sc))
+    for i, (prof, sc) in enumerate(keys):
+        model = initial_model_for_job_index(i)
+        enqueue_job(r, model, AnalyzeJob(profile_username=prof, post_shortcode=sc))
         n += 1
     return n
 
@@ -210,7 +214,7 @@ def _worker_loop(
     stop_event: threading.Event,
     brpop_timeout: int,
 ) -> None:
-    r = _redis_client()
+    r = redis_client()
     while not stop_event.is_set():
         claimed = claim_job(r, model, timeout_s=brpop_timeout)
         if claimed is None:
@@ -220,6 +224,7 @@ def _worker_loop(
             continue
         raw, job = claimed
         try:
+            # Contract: commit DB in process_one_job, then ACK (consume) the Redis message.
             process_one_job(client=client, model=model, job=job, tz=tz)
             ack_job(r, model, raw)
         except ModelQuotaExhausted:
@@ -263,6 +268,10 @@ def run_workers(
         t.start()
         threads.append(t)
         print(f"Started worker for {model}", file=sys.stderr)
+    print(
+        f"Running {len(threads)} workers (contract default: {DEFAULT_WORKER_COUNT}).",
+        file=sys.stderr,
+    )
 
     for t in threads:
         t.join()
@@ -273,7 +282,8 @@ def main(argv: list[str] | None = None) -> None:
     days = ai_analyze_recent_days()
     parser = argparse.ArgumentParser(
         description=(
-            "Multithreaded Gemini analysis via Redis (four model queues). "
+            f"Multithreaded Gemini analysis via Redis. Default: {DEFAULT_WORKER_COUNT} "
+            "workers (one thread per model queue). "
             f"DB candidates: posts from the last {days} days (UTC), "
             "ai_analyzed=false unless --reanalyze."
         )
@@ -316,7 +326,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.enqueue_only and args.workers_only:
         parser.error("Use at most one of --enqueue-only and --workers-only")
 
-    r = _redis_client()
+    r = redis_client()
     try:
         r.ping()
     except Exception as e:
@@ -338,7 +348,10 @@ def main(argv: list[str] | None = None) -> None:
             limit=args.limit,
             flush_queues=args.flush_queues,
         )
-        print(f"Enqueued {n} job(s) on queue {first_model_in_chain()!r}", file=sys.stderr)
+        print(
+            f"Enqueued {n} job(s) round-robin across {DEFAULT_WORKER_COUNT} model queues",
+            file=sys.stderr,
+        )
         depths = queue_depths(r)
         for m, (q, p) in depths.items():
             if q or p:

@@ -19,6 +19,8 @@
 #   REDIS_HOST=127.0.0.1 REDIS_PORT=6379
 #   redis-cli -h 127.0.0.1 -p ${REDIS_PORT:-6379} ping
 #
+#
+# docker exec -t playwright-playground-postgres pg_dump -U playground playground | \docker exec -i playwright-playground-postgres-test psql -U playground playground
 services:
   postgres:
     # 17 is a solid current major; pin here for reproducible builds (bump when you upgrade).

@@ -11,12 +11,21 @@ import redis
 
 QUEUE_PREFIX = "ai_analyze_mt"
 
+# Contract: four worker threads, one dedicated queue per model.
+DEFAULT_WORKER_COUNT = 4
+
 MODEL_QUEUE_CHAIN: tuple[str, ...] = (
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 )
+
+if len(MODEL_QUEUE_CHAIN) != DEFAULT_WORKER_COUNT:
+    raise RuntimeError(
+        f"MODEL_QUEUE_CHAIN must have {DEFAULT_WORKER_COUNT} models, "
+        f"got {len(MODEL_QUEUE_CHAIN)}"
+    )
 
 
 @dataclass
@@ -41,7 +50,7 @@ class AnalyzeJob:
         )
 
 
-def _redis_client() -> redis.Redis:
+def redis_client() -> redis.Redis:
     url = (os.environ.get("REDIS_URL") or "").strip()
     if url:
         return redis.Redis.from_url(url, decode_responses=True)
@@ -71,6 +80,11 @@ def next_model_in_chain(model: str) -> str | None:
 
 def first_model_in_chain() -> str:
     return MODEL_QUEUE_CHAIN[0]
+
+
+def initial_model_for_job_index(index: int) -> str:
+    """Round-robin: spread new jobs across all worker queues so four workers run in parallel."""
+    return MODEL_QUEUE_CHAIN[index % len(MODEL_QUEUE_CHAIN)]
 
 
 def enqueue_job(r: redis.Redis, model: str, job: AnalyzeJob) -> None:
