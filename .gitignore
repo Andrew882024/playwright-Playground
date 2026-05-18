@@ -10,3 +10,4 @@ __pycache__/
 app/ai_analyze_service/__pycache__/ai_analyze.cpython-312.pyc
 logs/
 test_Instagram/
+.env.*

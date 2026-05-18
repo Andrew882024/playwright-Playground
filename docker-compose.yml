@@ -1,24 +1,22 @@
 # --- Quick reference (run from this repo root) ---
 #
-# Bring Postgres up (detached):
+# Bring Postgres + Redis up (detached):
 #   docker compose up -d
 #
-# Stop and remove the container (data in volume `postgres_data` is kept):
+# Stop and remove containers (data in named volumes is kept):
 #   docker compose down
 #
-# Stop and remove container + volume (wipes the database):
+# Stop and remove containers + volumes (wipes Postgres and Redis data):
 #   docker compose down -v
 #
-# Port mapping below is HOST:CONTAINER — first number is your machine (default 5439),
-# second is Postgres inside the container (always 5432). Connect from the host with
-# DB_PORT (e.g. 5439), user/password/db from .env or defaults playground/playground.
+# Postgres: port mapping is HOST:CONTAINER (default host 5439 → container 5432).
+# Connect from the host with DB_PORT / credentials from .env or defaults playground/playground.
 #
-# Open psql on your host (needs `psql` installed):
 #   psql "postgresql://${DB_USERNAME:-playground}:${DB_PASSWORD:-playground}@127.0.0.1:${DB_PORT:-5439}/${DB_DATABASE:-playground}"
 #
-# Or a shell inside the container, then psql there (port 5432, user/db as above):
-#   docker exec -it playwright-playground-postgres sh
-#   psql -U playground -d playground
+# Redis (ai_analyze_service_mutithread): default host port 6379. From the host:
+#   REDIS_HOST=127.0.0.1 REDIS_PORT=6379
+#   redis-cli -h 127.0.0.1 -p ${REDIS_PORT:-6379} ping
 #
 services:
   postgres:
@@ -40,5 +38,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: playwright-playground-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
+  redis_data:
