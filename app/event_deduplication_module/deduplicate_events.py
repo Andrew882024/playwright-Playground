@@ -149,7 +149,9 @@ def _group_eligible_for_processing(rows: list[InstagramPosts]) -> bool:
 
 _SYSTEM = """You compare Instagram posts that share the same scheduled event start time.
 Some are duplicate announcements of the same real-world event; others may be different events
-that happen to start at the same time.
+that happen to start at the same time. There may be different small events within a larger event. 
+These small events should not be identified as different events; we want the one that can best 
+represent the larger event.
 
 Return a single JSON object matching the schema. No markdown, no code fences.
 
