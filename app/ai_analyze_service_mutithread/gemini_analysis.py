@@ -42,6 +42,7 @@ USER_AGENT = (
 
 _POST_DESC_MIN_WORDS = 50
 _POST_DESC_MAX_WORDS = 200
+_EVENT_TITLE_MAX_CHARS = 50
 
 _SYSTEM_INSTRUCTION = """You analyze Instagram posts for a campus/student-audience feed.
 Return a single JSON object matching the user's schema. No markdown, no code fences.
@@ -220,9 +221,12 @@ def ai_to_db_update_values(
     fb = (fallback_main_image_url or "").strip() if fallback_main_image_url else ""
     main_url: str | None = chosen if chosen else (fb if fb else None)
     loc = (ai.location or "").strip()
+    event_title = (ai.event_title or "").strip() if ai.is_event else None
+    if event_title and len(event_title) > _EVENT_TITLE_MAX_CHARS:
+        event_title = event_title[:_EVENT_TITLE_MAX_CHARS].rstrip()
     return {
         "is_event": ai.is_event,
-        "event_title": (ai.event_title or "").strip() if ai.is_event else None,
+        "event_title": event_title,
         "provider_name": (ai.provider_name or "").strip() if ai.is_event else None,
         "post_description": _post_description_for_db(ai),
         "duration_in_minutes": ai.duration_minutes,
@@ -424,7 +428,7 @@ def _user_prompt(
 Respond with JSON only, with these keys:
 - is_event (boolean)
 If is_event is true:
-  - event_title (string)
+  - event_title (string): at most {_EVENT_TITLE_MAX_CHARS} characters (letters, digits, spaces, punctuation all count); keep it short and headline-style.
   - provider_name (string)
   - start (object or null): year, month, day, hour, minute, timezone?, timezone_iana?, assumptions_note?
   - end (object or null): same shape as start; null if unknown

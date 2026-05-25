@@ -24,4 +24,6 @@ when one of them reach the limit and steal fail after retry, the message queue r
 
 important, when a post is prossessed it will be update in the db immediately, and after the related redis queue message will be consumed.
 
+the title of an event should not be more than 50 letters long
+
 we need to change our docker-compose.yml to add a redis, so we can use it
