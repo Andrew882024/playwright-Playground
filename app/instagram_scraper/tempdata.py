@@ -5,4 +5,5 @@ TARGET_URLS = [
     "keebsatucsd", 
     "acm.at.ucsd",
     "ucsdcenters","envisionucsd","dvcatucsd","ucsdasce","seventhcollegestudentcouncil","ttv.ucsd","rco.ucsd","animeclubatucsd","eighthcollegecouncil",
+    "netsatucsd","edssaatucsd","ucsdscerc",
 ]
