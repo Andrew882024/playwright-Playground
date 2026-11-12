@@ -44,6 +44,8 @@ def fetch_instagram_rows_for_profile(
         InstagramPosts.posted_unix_seconds.desc().nulls_last(),
         InstagramPosts.id.desc(),
     )
+    from app.instagram_scraper.parent_binding import production_candidates_only
+    stmt = stmt.where(production_candidates_only(InstagramPosts))
     with SessionLocal() as session:
         rows = session.execute(stmt).scalars().all()
     return list(rows)
@@ -61,6 +63,8 @@ def distinct_profile_usernames_recent(*, only_not_analyzed: bool = True) -> list
     )
     if only_not_analyzed:
         stmt = stmt.where(InstagramPosts.ai_analyzed.is_(False))
+    from app.instagram_scraper.parent_binding import production_candidates_only
+    stmt = stmt.where(production_candidates_only(InstagramPosts))
     with SessionLocal() as session:
         rows = session.execute(stmt).all()
     out: list[str] = []
@@ -93,6 +97,8 @@ def fetch_all_candidate_post_keys(
         InstagramPosts.posted_unix_seconds.desc().nulls_last(),
         InstagramPosts.id.desc(),
     )
+    from app.instagram_scraper.parent_binding import production_candidates_only
+    stmt = stmt.where(production_candidates_only(InstagramPosts))
     with SessionLocal() as session:
         rows = session.execute(stmt).all()
     out: list[tuple[str, str]] = []
@@ -110,5 +116,7 @@ def fetch_instagram_row(profile_username: str, post_shortcode: str) -> Instagram
         InstagramPosts.profile_username == pn,
         InstagramPosts.post_shortcode == sc,
     )
+    from app.instagram_scraper.parent_binding import production_candidates_only
+    stmt = stmt.where(production_candidates_only(InstagramPosts))
     with SessionLocal() as session:
         return session.execute(stmt).scalar_one_or_none()

@@ -42,7 +42,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,7 @@ def _load_env() -> None:
 _load_env()
 
 from Blueprint_db import InstagramPosts, SessionLocal  # noqa: E402
-from sqlalchemy import select  # noqa: E402
+from instagram_event_reconciliation import persist_analysis  # noqa: E402
 
 from app.ai_analyze_service.candidates import (  # noqa: E402
     distinct_profile_usernames_recent,
@@ -104,6 +104,7 @@ from app.ai_analyze_service.candidates import (  # noqa: E402
 from app.ai_analyze_service.config import ai_analyze_recent_days  # noqa: E402
 from app.ai_analyze_service.gemini_analysis import (  # noqa: E402
     ai_to_db_update_values,
+    ai_to_child_event_values,
     analyze_post,
     default_tz,
     format_ai_terminal_summary,
@@ -135,6 +136,7 @@ def build_analyzer_post_dict(row: InstagramPosts) -> dict[str, Any]:
         "shortcode": row.post_shortcode,
         "permalink": row.post_url,
         "title": row.post_title or "",
+        "caption": getattr(row, "caption", None) or "",
         "taken_at": taken,
         "from_username": row.profile_username,
         "comments": comments,
@@ -162,10 +164,26 @@ def _load_existing_ai_by_shortcode(path: Path) -> dict[str, dict[str, Any]]:
     m: dict[str, dict[str, Any]] = {}
     for p in data.get("posts") or []:
         sc = p.get("shortcode")
-        if isinstance(sc, str) and "ai" in p and isinstance(p["ai"], dict):
+        if (isinstance(sc, str) and isinstance(p.get("ai"), dict)
+                and "error" not in p["ai"] and isinstance(p["ai"].get("events"), list)):
             m[sc] = p["ai"]
     return m
 
+
+@dataclass
+class PostAttemptBudget:
+    """Shared only by one programmatic DB analysis invocation, across profiles."""
+
+    remaining: int
+
+    def consume(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+from app.ai_analyze_service import diagnostics as diagnostic
 
 def process_profile_db(
     profile_username: str,
@@ -177,55 +195,80 @@ def process_profile_db(
     only_not_analyzed: bool,
     sleep_s: float,
     chain_start_idx: int = 0,
+    post_id: int | None = None,
+    committed_parent_ids: set[int] | None = None,
+    attempt_budget: PostAttemptBudget | None = None,
+    analysis_stats: dict | None = None,
 ) -> int:
     """Load candidate rows from instagram_posts, run Gemini, UPDATE AI columns. Skips DB writes on errors."""
     pn = profile_username.lstrip("@").strip()
-    rows = fetch_instagram_rows_for_profile(pn, only_not_analyzed=only_not_analyzed)
+    rows = fetch_instagram_rows_for_profile(
+        pn, only_not_analyzed=only_not_analyzed, post_id=post_id,
+    )
     if not rows:
         parts = [
             f"No rows for profile {pn!r}",
             f"posted within the last {ai_analyze_recent_days()} days",
         ]
+        if post_id is not None:
+            parts.append(f"matching post id {post_id}")
         if only_not_analyzed:
             parts.append("with ai_analyzed = false")
         print(" ".join(parts), file=sys.stderr)
         return chain_start_idx
 
     analyzed = 0
+    attempted = 0
     chain_offset = chain_start_idx
 
     for row in rows:
-        if limit is not None and analyzed >= limit:
+        if limit is not None and attempted >= limit:
             break
-        post = build_analyzer_post_dict(row)
-        sc = post.get("shortcode")
+        if attempt_budget is not None and not attempt_budget.consume():
+            break
+        attempted += 1
+        if analysis_stats is not None:
+            analysis_stats['attempted'] += 1
+        committed = False
+        sc = row.post_shortcode
         try:
+            diagnostic.phase('input_preparation')
+            post = build_analyzer_post_dict(row)
+            sc = post.get("shortcode")
             ai, used_idx = analyze_post(
                 client, model_chain, post, tz, start_idx=chain_offset
             )
             chain_offset = used_idx
+            diagnostic.phase('response_parsing_validation')
             vals = ai_to_db_update_values(
                 ai,
                 tz,
                 fallback_main_image_url=primary_image_url_from_post(post),
             )
-            with SessionLocal() as session:
-                obj = session.execute(
-                    select(InstagramPosts).where(
-                        InstagramPosts.profile_username == pn,
-                        InstagramPosts.post_shortcode == row.post_shortcode,
-                    )
-                ).scalar_one()
-                for attr, value in vals.items():
-                    setattr(obj, attr, value)
-                obj.updated_at = datetime.now(timezone.utc)
-                session.commit()
+            diagnostic.phase('database_persistence')
+            written = persist_analysis(
+                SessionLocal, pn, row.post_shortcode, vals,
+                ai_to_child_event_values(ai, tz),
+                reanalyze=not only_not_analyzed,
+            )
+            if not written:
+                print(f"  Skip already analyzed {pn}/{sc}")
+                continue
+            diagnostic.committed()
+            if committed_parent_ids is not None:
+                committed_parent_ids.add(row.id)
             analyzed += 1
+            committed = True
+            if analysis_stats is not None:
+                analysis_stats['committed'] += 1
             sc_str = sc if isinstance(sc, str) else "?"
             print(format_ai_terminal_summary(sc_str, ai))
             if sleep_s > 0:
                 time.sleep(sleep_s)
         except Exception as e:
+            diagnostic.event('failure',e)
+            if analysis_stats is not None and not committed:
+                analysis_stats["failed"] += 1
             brief = format_analysis_error(e)
             print(f"  Error {sc}: {brief}", file=sys.stderr)
             if sleep_s > 0:
@@ -290,9 +333,7 @@ def process_profile_dir(
             row = dict(post)
             row["ai"] = {
                 "error": brief,
-                "is_event": False,
-                "description": f"Analysis failed: {brief}",
-                "confidence": "low",
+                "analysis_failed": True,
             }
             out_posts.append(row)
             analyzed += 1
@@ -311,7 +352,17 @@ def process_profile_dir(
     return chain_offset
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None, *, committed_parent_ids: set[int] | None = None,
+    max_attempts: int | None = None, analysis_stats: dict | None = None,
+    gemini_model_override: str | None = None,
+) -> None:
+    """CLI remains per-profile; max_attempts is a programmatic global DB cap."""
+    if max_attempts is not None and max_attempts < 0:
+        raise ValueError("max_attempts must be nonnegative or None")
+    if analysis_stats is not None:
+        analysis_stats.update(attempted=0, committed=0, failed=0)
+    budget = PostAttemptBudget(max_attempts) if max_attempts is not None else None
     days = ai_analyze_recent_days()
     parser = argparse.ArgumentParser(
         description=(
@@ -330,6 +381,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--post-id",
+        type=int,
+        default=None,
+        help="DB only: select exactly this instagram_posts.id; profile and recent-days filters still apply",
+    )
+    parser.add_argument(
         "--use-temp-download",
         action="store_true",
         help="Read posts.json / write posts_ai.json under temp_download/ instead of the database",
@@ -338,7 +395,7 @@ def main(argv: list[str] | None = None) -> None:
         "--limit",
         type=int,
         default=None,
-        help="Analyze at most this many posts per profile (DB: rows after ordering; legacy: others copied as-is)",
+        help="Attempt at most this many posts per profile, including failures (legacy: others copied as-is)",
     )
     parser.add_argument(
         "--resume",
@@ -357,11 +414,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Seconds to sleep between Gemini calls (default 3.0)",
     )
     args = parser.parse_args(argv)
+    if args.post_id is not None:
+        if args.use_temp_download:
+            parser.error("--post-id is only supported in DB mode")
+        if args.post_id <= 0:
+            parser.error("--post-id must be a positive integer")
+
+    if budget is not None and budget.remaining == 0:
+        print("Global Gemini post-attempt budget is 0; no posts attempted.")
+        return
 
     key = gemini_api_key()
-    model_chain = gemini_model_chain()
+    from app.ai_analyze_service.model_selection import select_chain
+    model_chain = select_chain(gemini_model_chain, gemini_model_override, parent_id=args.post_id)
     tz = default_tz()
-    client = genai.Client(api_key=key)
+    from app.ai_analyze_service.http_budget import current as current_http_budget
+    request_budget = current_http_budget()
+    from app.parent_pipeline.attempt_safety import current as current_durable_attempt
+    http_options = {"timeout": 120_000}
+    if (request_budget is not None and request_budget.strict) or current_durable_attempt() is not None:
+        # One SDK generation dispatch must never hide internal HTTP retries.
+        http_options["retry_options"] = {"attempts": 1}
+    client = genai.Client(api_key=key, http_options=http_options)
 
     print(
         f"Gemini model chain ({len(model_chain)}): {' → '.join(model_chain)}",
@@ -400,20 +474,29 @@ def main(argv: list[str] | None = None) -> None:
     if args.profile and args.profile.strip():
         profile_list = [args.profile.strip().lstrip("@")]
     else:
-        profile_list = distinct_profile_usernames_recent(only_not_analyzed=only_not_analyzed)
+        profile_list = distinct_profile_usernames_recent(
+            only_not_analyzed=only_not_analyzed, post_id=args.post_id,
+        )
         if not profile_list:
             print(
-                "DB mode: no profiles found with candidate posts in the recent window "
+                (f"DB mode: no eligible post matching id {args.post_id} in the recent window "
+                 if args.post_id is not None else
+                 "DB mode: no profiles found with candidate posts in the recent window ")
+                +
                 f"(last {days} days"
                 + (", pending analysis only" if only_not_analyzed else "")
                 + "). "
                 "Scrape first, widen AI_ANALYZE_RECENT_DAYS, pass --profile, or use --reanalyze.",
                 file=sys.stderr,
             )
+            if analysis_stats is not None or committed_parent_ids is not None:
+                return
             sys.exit(1)
 
     chain_offset = 0
     for pn in profile_list:
+        if budget is not None and budget.remaining == 0:
+            break
         print(f"Profile: {pn}")
         chain_offset = process_profile_db(
             pn,
@@ -424,7 +507,14 @@ def main(argv: list[str] | None = None) -> None:
             only_not_analyzed=only_not_analyzed,
             sleep_s=args.sleep,
             chain_start_idx=chain_offset,
+            post_id=args.post_id,
+            committed_parent_ids=committed_parent_ids,
+            attempt_budget=budget,
+            **({"analysis_stats": analysis_stats} if analysis_stats is not None else {}),
         )
+    if budget is not None and budget.remaining == 0:
+        print("Global Gemini post-attempt budget exhausted.")
+
 
 
 if __name__ == "__main__":

@@ -10,3 +10,13 @@ __pycache__/
 app/ai_analyze_service/__pycache__/ai_analyze.cpython-312.pyc
 logs/
 test_Instagram/
+
+# Durable generated-cover sources, PNGs, manifests and lock files
+event_cover_cache/
+
+# Private collection staging: post metadata, image references, provenance and locks
+.instagram-post-staging/
+
+# Private cover artifacts and durable per-post request journals
+.event-cover-cache/
+.parent-pipeline-attempts/

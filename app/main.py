@@ -8,6 +8,8 @@ from app.routes.instagram_pipeline import router as instagram_pipeline_router
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+from app.routes.recovery_read import router as recovery_read_router
+app.include_router(recovery_read_router)
 app.include_router(fomo_sync_router, prefix="/sync", tags=["fomo"])
 app.include_router(instagram_pipeline_router, prefix="/sync", tags=["instagram"])
 

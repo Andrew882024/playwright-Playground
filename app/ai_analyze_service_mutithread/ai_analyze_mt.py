@@ -20,12 +20,10 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from google import genai
-from sqlalchemy import select
 from zoneinfo import ZoneInfo
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -69,6 +67,7 @@ def _load_env() -> None:
 _load_env()
 
 from Blueprint_db import InstagramPosts, SessionLocal  # noqa: E402
+from instagram_event_reconciliation import persist_analysis  # noqa: E402
 
 from app.ai_analyze_service_mutithread.candidates import (  # noqa: E402
     fetch_all_candidate_post_keys,
@@ -79,6 +78,7 @@ from app.ai_analyze_service_mutithread.gemini_analysis import (  # noqa: E402
     ALL_MODELS_EXHAUSTED_MSG,
     ModelQuotaExhausted,
     ai_to_db_update_values,
+    ai_to_child_event_values,
     analyze_post_single_model,
     default_tz,
     format_ai_terminal_summary,
@@ -147,7 +147,7 @@ def enqueue_candidates_from_db(
     n = 0
     for i, (prof, sc) in enumerate(keys):
         model = initial_model_for_job_index(i)
-        enqueue_job(r, model, AnalyzeJob(profile_username=prof, post_shortcode=sc))
+        enqueue_job(r, model, AnalyzeJob(profile_username=prof, post_shortcode=sc, reanalyze=not only_not_analyzed))
         n += 1
     return n
 
@@ -158,24 +158,19 @@ def _commit_analysis(
     post: dict[str, Any],
     ai,
     tz: ZoneInfo,
-) -> None:
+    *,
+    reanalyze: bool = False,
+) -> bool:
     pn = profile_username.lstrip("@").strip()
     vals = ai_to_db_update_values(
         ai,
         tz,
         fallback_main_image_url=primary_image_url_from_post(post),
     )
-    with SessionLocal() as session:
-        obj = session.execute(
-            select(InstagramPosts).where(
-                InstagramPosts.profile_username == pn,
-                InstagramPosts.post_shortcode == post_shortcode,
-            )
-        ).scalar_one()
-        for attr, value in vals.items():
-            setattr(obj, attr, value)
-        obj.updated_at = datetime.now(timezone.utc)
-        session.commit()
+    return persist_analysis(
+        SessionLocal, pn, post_shortcode, vals, ai_to_child_event_values(ai, tz),
+        reanalyze=reanalyze,
+    )
 
 
 def process_one_job(
@@ -192,7 +187,7 @@ def process_one_job(
             file=sys.stderr,
         )
         return
-    if row.ai_analyzed:
+    if row.ai_analyzed and not job.reanalyze:
         print(
             f"  Skip already analyzed {job.profile_username}/{job.post_shortcode}",
             file=sys.stderr,
@@ -201,7 +196,11 @@ def process_one_job(
     post = build_analyzer_post_dict(row)
     sc = post.get("shortcode")
     ai = analyze_post_single_model(client, model, post, tz)
-    _commit_analysis(job.profile_username, job.post_shortcode, post, ai, tz)
+    if not _commit_analysis(
+        job.profile_username, job.post_shortcode, post, ai, tz, reanalyze=job.reanalyze
+    ):
+        print(f"  Skip already analyzed {job.profile_username}/{job.post_shortcode}")
+        return
     sc_str = sc if isinstance(sc, str) else "?"
     print(format_ai_terminal_summary(sc_str, ai))
 

@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -32,7 +33,10 @@ db_database = os.getenv("DB_DATABASE", "playground")
 
 db_url = f"postgresql+psycopg2://{db_username}:{db_password}@{db_hostname}:{db_port}/{db_database}"
 
-engine = create_engine(db_url)
+engine = create_engine(db_url, connect_args={
+    "connect_timeout": 10,
+    "options": "-c statement_timeout=120000 -c lock_timeout=15000",
+})
 
 Base = declarative_base()
 
@@ -82,5 +86,57 @@ class InstagramPosts(Base):
 
     own_s3_url_for_main_image = Column(Text, nullable=True)
 
+    # Parent aggregate presentation/cover; legacy child cover fields stay intact.
+    collection_title = Column(Text, nullable=True)
+    generated_image_url = Column(Text, nullable=True)
+    generated_image_input_hash = Column(String(64), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class InstagramEvents(Base):
+    """Zero or more events per post; original images stay on the parent."""
+
+    __tablename__ = "instagram_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    instagram_post_id = Column(
+        Integer, ForeignKey("instagram_posts.id"), nullable=False, index=True
+    )
+    event_title = Column(Text, nullable=False)
+    provider_name = Column(Text, nullable=True)
+    event_description = Column(Text, nullable=True)
+    location = Column(Text, nullable=True)
+    event_start_at = Column(DateTime(timezone=True), nullable=True)
+    event_end_at = Column(DateTime(timezone=True), nullable=True)
+    duration_in_minutes = Column(Integer, nullable=True)
+    confidence = Column(String(16), nullable=True)
+    is_duplicated = Column(Boolean, nullable=True)
+    generated_image_url = Column(Text, nullable=True)
+    generated_image_input_hash = Column(String(64), nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
+class InstagramPipelineRecovery(Base):
+    __tablename__ = 'instagram_pipeline_recovery'
+    instagram_post_id = Column(Integer, ForeignKey('instagram_posts.id'), primary_key=True)
+    stage = Column(String(16), primary_key=True)
+    source_revision = Column(String(64), nullable=False)
+    acknowledged_revision = Column(String(64), nullable=True)
+    status = Column(String(24), nullable=False, default='pending')
+    attempt_count = Column(Integer, nullable=False, default=0)
+    failure_count = Column(Integer, nullable=False, default=0)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    safe_reason = Column(String(64), nullable=True)
+    lease_token = Column(String(32), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)

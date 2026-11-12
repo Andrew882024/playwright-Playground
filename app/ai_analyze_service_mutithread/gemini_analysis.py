@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from app.ai_analyze_service.event_evidence import (EVIDENCE_INSTRUCTION, classify_event, classify_post, prioritize_images, image_evidence_note, constrain_sources)
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_field, model_validator
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 # DEFAULT_MODEL = "gemini-2.5-flash-lite"
@@ -55,9 +56,13 @@ Event vs not:
   schedulable occurrence.
 
 Rules:
-- Use the post's title, comments array (caption + thread replies), and any attached images (flyers).
+- Return a REQUIRED events array: one item per independently attendable event/session.
+- Do NOT merge separate sessions into one first-start-to-last-end time window.
+- Duplicate mentions/slides of the same session must not become duplicate events.
+- Each event has its own title, host, description, location, start, end, duration, confidence.
+- Use the first original image as primary visual evidence and the caption as complementary text; later images are supplemental.
 - Resolve relative dates ("this Saturday", "tomorrow") using the reference datetime provided.
-- If you cannot resolve year/month/day or time from the text, use null for those fields and
+- If you cannot resolve year/month/day or time from consistent image/caption evidence, use null for those fields and
   explain in raw_notes. Do not invent a year.
 - For events, provider_name is the organizing host (student council, department, etc.); use
   from_username only if no clearer host is named.
@@ -65,8 +70,12 @@ Rules:
   duration_minutes when you can compute it.
 - Times: use 24-hour fields in start/end (hour 0-23, minute 0-59). If only 12h text is given,
   convert and note ambiguity in raw_notes.
-- For non-events, description must be prose; for events, event_description must be prose.
-  Each must be 50–200 words (count whitespace-separated tokens), inclusive.
+- Public description and event_description must contain event facts only, grounded in the source.
+  Use 1–2 concise sentences (at most 60 words); return an empty string if no supported descriptive facts exist.
+  Never add date discrepancy warnings, fact-check commentary, uncertainty commentary,
+  advice to verify with organizers, AI reasoning, or invented information.
+  Put any verification concerns, missing information or uncertainty in raw_notes only, never public descriptions.
+  events=[] is successful zero-event output; missing events is invalid.
 - location: when the post states where something happens (room, building, campus, address,
   city/neighborhood, or "Online" / a meeting link), output a short human-readable string; use null
   if no place is given or it does not apply.
@@ -78,15 +87,17 @@ Rules:
   The value must be exactly one of the listed loaded image URL strings when multiple URLs exist.
 """
 
+_SYSTEM_INSTRUCTION += "\n" + EVIDENCE_INSTRUCTION
+
 
 class DateTimeParts(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    year: Optional[int] = None
-    month: Optional[int] = None
-    day: Optional[int] = None
-    hour: Optional[int] = None
-    minute: Optional[int] = None
+    year: Optional[int] = Field(default=None, ge=1, le=9999)
+    month: Optional[int] = Field(default=None, ge=1, le=12)
+    day: Optional[int] = Field(default=None, ge=1, le=31)
+    hour: Optional[int] = Field(default=None, ge=0, le=23)
+    minute: Optional[int] = Field(default=None, ge=0, le=59)
     timezone: Optional[str] = None
     timezone_iana: Optional[str] = None
     assumptions_note: Optional[str] = None
@@ -104,30 +115,19 @@ def _truncate_to_max_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 
-def _post_description_source_text(ai: PostAnalysisAI) -> str:
-    if ai.is_event:
-        return (ai.event_description or "").strip()
-    return (ai.description or "").strip()
-
-
-def _post_description_for_db(ai: PostAnalysisAI) -> str:
-    """Persisted post_description: at most _POST_DESC_MAX_WORDS (validator enforces minimum on ingest)."""
-    return _truncate_to_max_words(_post_description_source_text(ai), _POST_DESC_MAX_WORDS)
-
-
 def _zone_for_datetime_parts(parts: DateTimeParts, default_tz: ZoneInfo) -> ZoneInfo:
     iana = (parts.timezone_iana or "").strip()
     if iana:
         try:
             return ZoneInfo(iana)
-        except ZoneInfoNotFoundError:
-            pass
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown event timezone: {iana}") from exc
     tz_hint = (parts.timezone or "").strip()
     if tz_hint and "/" in tz_hint:
         try:
             return ZoneInfo(tz_hint)
-        except ZoneInfoNotFoundError:
-            pass
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown event timezone: {tz_hint}") from exc
     return default_tz
 
 
@@ -135,72 +135,105 @@ def _datetime_from_parts(
     parts: DateTimeParts | None,
     default_tz: ZoneInfo,
 ) -> datetime | None:
-    """Full calendar date required (y/m/d); hour/minute default to 0. No invented year."""
+    """Require a complete date and clock time; never manufacture midnight."""
     if parts is None:
         return None
-    y, mo, d = parts.year, parts.month, parts.day
-    if y is None or mo is None or d is None:
+    values = (parts.year, parts.month, parts.day, parts.hour, parts.minute)
+    if any(value is None for value in values):
         return None
-    h = 0 if parts.hour is None else int(parts.hour)
-    mi = 0 if parts.minute is None else int(parts.minute)
-    if not (0 <= h <= 23 and 0 <= mi <= 59):
-        return None
-    try:
-        z = _zone_for_datetime_parts(parts, default_tz)
-        return datetime(y, mo, d, h, mi, tzinfo=z)
-    except (ValueError, TypeError, OSError):
-        return None
+    return datetime(*values, tzinfo=_zone_for_datetime_parts(parts, default_tz))
 
 
-class PostAnalysisAI(BaseModel):
-    """Validated Gemini output for one post."""
+class ExtractedEventAI(BaseModel):
+    """One independently attendable event/session; never an aggregate time window."""
 
     model_config = ConfigDict(extra="ignore")
 
-    is_event: bool
-    event_title: Optional[str] = None
-    provider_name: Optional[str] = None
-    description: Optional[str] = None
-    start: Optional[DateTimeParts] = None
-    end: Optional[DateTimeParts] = None
+    event_title: str = Field(max_length=_EVENT_TITLE_MAX_CHARS)
+    provider_name: Optional[str]
+    event_description: str
+    location: Optional[str]
+    start: Optional[DateTimeParts]
+    end: Optional[DateTimeParts]
+    duration_minutes: Optional[int] = Field(ge=0)
+    confidence: Optional[Literal["low", "medium", "high"]]
     duration: Optional[str] = None
-    duration_minutes: Optional[int] = None
-    event_description: Optional[str] = None
-    confidence: Optional[Literal["low", "medium", "high"]] = None
     raw_notes: Optional[str] = None
-    location: Optional[str] = None
-    # Best cover image among those loaded for this request; set after validation in analyze_post.
-    main_image_url: Optional[str] = None
-    # Set by the analyzer after a successful API call (not returned by Gemini JSON).
-    gemini_model: Optional[str] = None
+
+    field_sources: dict[Literal["event_title", "start", "location"], list[Literal["first_image", "caption", "supplemental_image"]]] = Field(default_factory=dict)
+    conflicting_fields: list[Literal["event_title", "start", "location"]] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def detection_status(self) -> str:
+        return classify_event(self)
 
     @model_validator(mode="after")
-    def _validate_branch(self) -> PostAnalysisAI:
-        if self.is_event:
-            if not (self.event_title or "").strip():
-                raise ValueError("event_title is required when is_event is true")
-            if not (self.provider_name or "").strip():
-                raise ValueError("provider_name is required when is_event is true")
-            body = (self.event_description or "").strip()
-            if not body:
-                raise ValueError("event_description is required when is_event is true")
-            wc = _word_count(body)
-            if wc < _POST_DESC_MIN_WORDS or wc > _POST_DESC_MAX_WORDS:
-                raise ValueError(
-                    f"event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words "
-                    f"(got {wc})"
-                )
-        else:
-            body = (self.description or "").strip()
-            if not body:
-                raise ValueError("description is required when is_event is false")
-            wc = _word_count(body)
-            if wc < _POST_DESC_MIN_WORDS or wc > _POST_DESC_MAX_WORDS:
-                raise ValueError(
-                    f"description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words "
-                    f"(got {wc})"
-                )
+    def _validate_event(self) -> ExtractedEventAI:
+        self.event_title = self.event_title.strip()
+        if not self.event_title:
+            raise ValueError("event_title must not be blank")
+        wc = _word_count(self.event_description)
+        if wc > _POST_DESC_MAX_WORDS:
+            raise ValueError("event_description must be at most 200 words (legacy-compatible)")
         return self
+
+
+class PostAnalysisAI(BaseModel):
+    """A required events array distinguishes zero events from invalid/failed output."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    events: list[ExtractedEventAI]
+    description: str
+    raw_notes: Optional[str] = None
+    main_image_url: Optional[str] = None
+    gemini_model: Optional[str] = None
+
+    @computed_field
+    @property
+    def detection_status(self) -> str:
+        return classify_post(self.events)
+
+    @computed_field
+    @property
+    def is_event(self) -> bool:
+        return bool(self.events)
+
+    @model_validator(mode="after")
+    def _validate_description(self) -> PostAnalysisAI:
+        if _word_count(self.description) > _POST_DESC_MAX_WORDS:
+            raise ValueError("description must be at most 200 words (legacy-compatible)")
+        return self
+
+
+def event_to_db_values(event: ExtractedEventAI, tz: ZoneInfo) -> dict[str, Any]:
+    """Convert each session independently; unknown clock times remain null."""
+    start = _datetime_from_parts(event.start, tz)
+    end = _datetime_from_parts(event.end, tz)
+    duration = event.duration_minutes
+    if start is not None and end is not None:
+        seconds = (end.astimezone(ZoneInfo("UTC")) - start.astimezone(ZoneInfo("UTC"))).total_seconds()
+        if seconds <= 0:
+            raise ValueError("event end must be after its start")
+        actual_minutes = int(seconds / 60)
+        if duration is not None and duration != actual_minutes:
+            raise ValueError("duration_minutes disagrees with event start/end")
+        duration = actual_minutes
+    return {
+        "event_title": event.event_title,
+        "provider_name": (event.provider_name or "").strip() or None,
+        "event_description": event.event_description.strip(),
+        "location": (event.location or "").strip() or None,
+        "event_start_at": start,
+        "event_end_at": end,
+        "duration_in_minutes": duration,
+        "confidence": event.confidence,
+    }
+
+
+def ai_to_child_event_values(ai: PostAnalysisAI, tz: ZoneInfo) -> list[dict[str, Any]]:
+    return [event_to_db_values(event, tz) for event in ai.events]
 
 
 def primary_image_url_from_post(post: dict[str, Any]) -> str | None:
@@ -215,28 +248,32 @@ def ai_to_db_update_values(
     *,
     fallback_main_image_url: str | None = None,
 ) -> dict[str, Any]:
-    start_at = _datetime_from_parts(ai.start, default_tz) if ai.is_event else None
-    end_at = _datetime_from_parts(ai.end, default_tz) if ai.is_event else None
-    chosen = (ai.main_image_url or "").strip() if ai.main_image_url else ""
-    fb = (fallback_main_image_url or "").strip() if fallback_main_image_url else ""
-    main_url: str | None = chosen if chosen else (fb if fb else None)
-    loc = (ai.location or "").strip()
-    event_title = (ai.event_title or "").strip() if ai.is_event else None
-    if event_title and len(event_title) > _EVENT_TITLE_MAX_CHARS:
-        event_title = event_title[:_EVENT_TITLE_MAX_CHARS].rstrip()
+    """Project one deterministic child for legacy readers, never an aggregate window."""
+    children = ai_to_child_event_values(ai, default_tz)
+    def sort_key(event: dict[str, Any]) -> tuple:
+        start = event["event_start_at"]
+        return (
+            start is None,
+            start.astimezone(ZoneInfo("UTC")).isoformat() if start else "",
+            " ".join(event["event_title"].casefold().split()),
+            json.dumps(event, sort_keys=True, default=str),
+        )
+    representative = min(children, key=sort_key) if children else {}
+    chosen = (ai.main_image_url or "").strip()
+    fallback = (fallback_main_image_url or "").strip()
     return {
-        "is_event": ai.is_event,
-        "event_title": event_title,
-        "provider_name": (ai.provider_name or "").strip() if ai.is_event else None,
-        "post_description": _post_description_for_db(ai),
-        "duration_in_minutes": ai.duration_minutes,
-        "confidence": ai.confidence,
+        "is_event": bool(children),
+        "event_title": representative.get("event_title"),
+        "provider_name": representative.get("provider_name"),
+        "post_description": representative.get("event_description", ai.description.strip()),
+        "location": representative.get("location"),
+        "duration_in_minutes": representative.get("duration_in_minutes"),
+        "confidence": representative.get("confidence"),
         "ai_model": ai.gemini_model,
         "ai_analyzed": True,
-        "event_start_at": start_at,
-        "event_end_at": end_at,
-        "main_image_url": main_url,
-        "location": loc if loc else None,
+        "event_start_at": representative.get("event_start_at"),
+        "event_end_at": representative.get("event_end_at"),
+        "main_image_url": chosen or fallback or None,
     }
 
 
@@ -313,7 +350,7 @@ def _image_urls_from_post(post: dict[str, Any], limit: int = MAX_IMAGES) -> list
     elif isinstance(omu, list):
         urls.extend(str(u) for u in omu if isinstance(u, str))
     out: list[str] = []
-    for u in urls:
+    for u in prioritize_images(urls, post):
         if _is_probably_video(u):
             continue
         if not _looks_like_image_url(u):
@@ -322,7 +359,7 @@ def _image_urls_from_post(post: dict[str, Any], limit: int = MAX_IMAGES) -> list
             out.append(u)
         if len(out) >= limit:
             break
-    return out
+    return prioritize_images(out, post)
 
 
 def _mime_from_url(url: str) -> str:
@@ -371,6 +408,9 @@ def _taken_at_reference_line(taken_at: Any, tz: ZoneInfo) -> str:
 
 
 def _caption_text_from_post(post: dict[str, Any]) -> str:
+    explicit = post.get("caption")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
     raw = post.get("comments")
     if isinstance(raw, list):
         for c in raw:
@@ -422,32 +462,30 @@ def _user_prompt(
     img_note = (
         f"{num_images} image(s) are attached after this text (flyer/carousel)."
         if num_images
-        else "No images could be loaded; use title and comments text only."
+        else "No images could be loaded; use the Instagram caption only as source evidence and do not claim visual evidence."
     )
     schema = f"""
-Respond with JSON only, with these keys:
-- is_event (boolean)
-If is_event is true:
-  - event_title (string): at most {_EVENT_TITLE_MAX_CHARS} characters (letters, digits, spaces, punctuation all count); keep it short and headline-style.
-  - provider_name (string)
-  - start (object or null): year, month, day, hour, minute, timezone?, timezone_iana?, assumptions_note?
-  - end (object or null): same shape as start; null if unknown
-  - duration (string or null): e.g. "7:00 PM – 9:00 PM"
-  - duration_minutes (integer or null)
-  - event_description (string): prose summary of the activity for a student feed;
-    must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words inclusive (count words as whitespace-separated tokens).
-If is_event is false:
-  - description (string): what this post is about;
-    must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words inclusive (count words as whitespace-separated tokens).
-Always include when possible:
-  - confidence: "low" | "medium" | "high"
-  - raw_notes (string or null): ambiguities or missing info
-  - location (string or null): venue, building/room, campus, neighborhood, address, or Online / meeting link
-    if clearly stated; otherwise null
-  - main_image_url (string or null): when "Image URLs loaded for analysis" lists URLs below, set this
-    to exactly one of those strings (copy verbatim) — the single image that best represents the post
-    in a feed (events: clearest title/date/time/location on a flyer; non-events: strongest visual hook
-    or clearest message; prefer legible text over decorative-only slides). If that list is empty, use null.
+Respond with JSON only:
+- events (REQUIRED array): [] for a successful analysis with no attendable event.
+  Each independently attendable event/session is a separate item containing ALL keys:
+  - event_title (nonempty string; at most 50 characters)
+  - provider_name (organizing host string, or null if unknown)
+  - event_description (0–60 words; 1–2 concise event-only sentences, or empty; no warnings or AI commentary)
+  - location (string or null)
+  - start (object or null): year, month, day, hour, minute, timezone_iana
+  - end (same shape or null)
+  - duration_minutes (nonnegative integer or null)
+  - confidence ("low", "medium", "high", or null)
+  Optional session keys: duration (human-readable string), raw_notes.
+- description (0–60 word event-only post context, including when events is empty; no warnings or AI commentary)
+- raw_notes (string or null): ambiguities and missing information
+- main_image_url (one of the loaded URLs or null): one representative image for the POST.
+Do NOT merge separate sessions into one first-start-to-last-end time window.
+For example, Coffee Chats 10:00–12:00 and Tech Talk 17:00–18:30 on the same day
+must be TWO items, with durations 120 and 90 minutes, not a single 10:00–18:30 event.
+Do not repeat an event merely because it appears in both caption and flyer slides.
+Use null for unknown date/time components; do not invent a midnight time.
+Use the supplied reference timestamp to resolve relative dates; never invent a year.
 """
     url_block = ""
     if loaded_image_urls:
@@ -457,12 +495,13 @@ Always include when possible:
             f"{lines}\n"
         )
     return (
-        f"{schema}\n\n"
+        f"{schema}\n\n{EVIDENCE_INSTRUCTION}\n{image_evidence_note(post, loaded_image_urls)}\n\n"
         f"{ref_line}\n\n"
         f"from_username: {user}\n"
         f"shortcode: {shortcode}\n"
         f"permalink: {link}\n"
         f"title: {title}\n"
+        f"Instagram caption (complementary evidence): {caption}\n"
         f"{text_block}"
         f"{img_note}"
         f"{url_block}"
@@ -633,26 +672,20 @@ def _resolve_main_image_url(
 
 
 def format_ai_terminal_summary(shortcode: str, ai: PostAnalysisAI) -> str:
-    """Human-readable one-line summary of a successful analysis (stdout)."""
-    conf = ai.confidence or "?"
-    sc = shortcode if shortcode else "?"
-    mod = ai.gemini_model or "?"
-    if ai.is_event:
-        parts = [
-            f'title="{_clip_one_line(ai.event_title or "", 72)}"',
-            f'provider="{_clip_one_line(ai.provider_name or "", 48)}"',
-        ]
-        if ai.duration:
-            parts.append(f'when="{_clip_one_line(ai.duration, 40)}"')
-        elif ai.start and ai.start.year and ai.start.month and ai.start.day:
-            y, m, d = ai.start.year, ai.start.month, ai.start.day
-            parts.append(f"start={y:04d}-{m:02d}-{d:02d}")
-        if (ai.location or "").strip():
-            parts.append(f'loc="{_clip_one_line(ai.location or "", 56)}"')
-        body = " | ".join(parts)
-        return f"  AI [{sc}] model={mod} {conf}: event — {body}"
-    desc = _clip_one_line(ai.description or "", 110)
-    return f"  AI [{sc}] model={mod} {conf}: not an event — {desc}"
+    """Display each session rather than a misleading aggregate window."""
+    heading = f"  AI [{shortcode or '?'}] model={ai.gemini_model or '?'}: {len(ai.events)} event(s)"
+    lines = [heading]
+    for event in ai.events:
+        start = event.start.model_dump(exclude_none=True) if event.start else None
+        end = event.end.model_dump(exclude_none=True) if event.end else None
+        lines.append(
+            f"    {event.event_title} | provider={event.provider_name or '?'} | "
+            f"start={start} | end={end} | duration={event.duration_minutes} min | "
+            f"location={event.location or '?'} | confidence={event.confidence or '?'}"
+        )
+    if not ai.events:
+        lines.append(f"    not an event — {_clip_one_line(ai.description, 110)}")
+    return "\n".join(lines)
 
 
 def analyze_post(
@@ -703,8 +736,9 @@ def analyze_post(
         for attempt in range(3):
             _fix_parts = [
                 "\n\nYour previous output was invalid. Output only valid JSON matching the schema. ",
-                f"If is_event is false, description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words; "
-                f"if true, event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words.",
+                "Include the required events array and all per-session fields. "
+                "description and each event_description must be concise, at most 60 words, and contain only source-supported event facts; no warnings, uncertainty commentary, verification advice or AI reasoning. Use raw_notes for concerns. "
+                "Never merge independently attendable sessions into one time window.",
             ]
             if attempt > 0 and len(loaded_image_urls) > 1:
                 _fix_parts.append(
@@ -724,6 +758,8 @@ def analyze_post(
                 raw = (resp.text or "").strip()
                 data = _parse_json_text(raw)
                 ai = PostAnalysisAI.model_validate(data)
+                ai = constrain_sources(ai, post, loaded_image_urls, bool(_caption_text_from_post(post)))
+                ai_to_child_event_values(ai, tz)
                 notes = (ai.raw_notes or "").strip()
                 upd: dict[str, Any] = {"gemini_model": model}
                 final_main, main_note = _resolve_main_image_url(
@@ -835,8 +871,9 @@ def analyze_post_single_model(
     for attempt in range(3):
         _fix_parts = [
             "\n\nYour previous output was invalid. Output only valid JSON matching the schema. ",
-            f"If is_event is false, description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words; "
-            f"if true, event_description must be {_POST_DESC_MIN_WORDS}–{_POST_DESC_MAX_WORDS} words.",
+            "Include the required events array and all per-session fields. "
+            "description and each event_description must be concise, at most 60 words, and contain only source-supported event facts; no warnings, uncertainty commentary, verification advice or AI reasoning. Use raw_notes for concerns. "
+            "Never merge independently attendable sessions into one time window.",
         ]
         if attempt > 0 and len(loaded_image_urls) > 1:
             _fix_parts.append(
@@ -856,6 +893,8 @@ def analyze_post_single_model(
             raw = (resp.text or "").strip()
             data = _parse_json_text(raw)
             ai = PostAnalysisAI.model_validate(data)
+            ai = constrain_sources(ai, post, loaded_image_urls, bool(_caption_text_from_post(post)))
+            ai_to_child_event_values(ai, tz)
             notes = (ai.raw_notes or "").strip()
             upd: dict[str, Any] = {"gemini_model": model}
             final_main, main_note = _resolve_main_image_url(
