@@ -1,3 +1,5 @@
+docker compose up -d
+
 python app/instagram_scraper/sync_ins.py  
 python app/ai_analyze_service/ai_analyze.py
 python app/event_deduplication_module/deduplicate_events.py

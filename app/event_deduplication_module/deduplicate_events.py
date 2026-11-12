@@ -260,7 +260,7 @@ def run_deduplication() -> RunStats:
     stats = RunStats()
     key = _gemini_api_key()
     chain = _model_chain()
-    client = genai.Client(api_key=key)
+    client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
     with SessionLocal() as session:
         times_stmt = (

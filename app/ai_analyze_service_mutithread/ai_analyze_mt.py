@@ -362,7 +362,7 @@ def main(argv: list[str] | None = None) -> None:
 
     key = gemini_api_key()
     tz = default_tz()
-    client = genai.Client(api_key=key)
+    client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
     print(
         f"Workers for models: {' → '.join(MODEL_QUEUE_CHAIN)}",
         file=sys.stderr,

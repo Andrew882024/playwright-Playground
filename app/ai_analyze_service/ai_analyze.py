@@ -361,7 +361,7 @@ def main(argv: list[str] | None = None) -> None:
     key = gemini_api_key()
     model_chain = gemini_model_chain()
     tz = default_tz()
-    client = genai.Client(api_key=key)
+    client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
     print(
         f"Gemini model chain ({len(model_chain)}): {' → '.join(model_chain)}",
