@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.fomo_sync.sync_service import fomo_sync_settings, run_full_fomo_sync
@@ -27,7 +27,9 @@ class FomoSyncResponse(BaseModel):
     )
 
 
-router = APIRouter()
+from app.service_auth import require_sync_service, SafeSyncRoute
+
+router = APIRouter(route_class=SafeSyncRoute, dependencies=[Depends(require_sync_service)])
 
 
 @router.post("/fomo", response_model=FomoSyncResponse)
@@ -39,8 +41,8 @@ def post_sync_fomo() -> FomoSyncResponse:
         success=r.success,
         rows_sent=r.rows_sent,
         batches=r.batches,
-        error=r.error,
+        error='sync_failed' if r.error else None,
         failed_batch=r.failed_batch,
         http_status=r.http_status,
-        fomo_ingest_url=ingest_url or None,
+        fomo_ingest_url=None,
     )

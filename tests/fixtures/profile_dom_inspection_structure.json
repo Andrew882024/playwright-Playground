@@ -1,0 +1,49 @@
+{
+  "status": "inspected",
+  "browser_launches": 1,
+  "navigation_attempts": 1,
+  "database_writes": 0,
+  "gemini_requests": 0,
+  "openai_requests": 0,
+  "structure": {
+    "target_navigation": true,
+    "visible_main_count": 1,
+    "literal_main_count": 1,
+    "visible_header_count": 1,
+    "exact_profile_header_matches": 1,
+    "header_heading_shapes": [
+      {"tag": "h2", "role": "none_or_other", "attributes": [], "count": 1},
+      {"tag": "h1", "role": "none_or_other", "attributes": [], "count": 1}
+    ],
+    "role_counts": {"tablist": 1, "tab": 0, "tabpanel": 1, "grid": 0, "row": 0, "gridcell": 0},
+    "selected_tab_count": 0,
+    "linked_selected_tab_panel_count": 0,
+    "grid_shapes": [],
+    "panel_shapes": [{"tag": "div", "role": "tabpanel", "attributes": ["role"], "count": 1}],
+    "cell_shapes": [],
+    "tab_shapes": [],
+    "profile_navigation_link_shapes": [
+      {"tag": "a", "role": "link", "attributes": ["role", "href", "aria-selected"], "count": 3}
+    ],
+    "visible_post_link_count": 12,
+    "permalink_patterns": {"p_shortcode": 0, "reel_shortcode": 0, "profile_p_shortcode": 12, "profile_reel_shortcode": 0},
+    "post_link_shapes": [{"tag": "a", "role": "link", "attributes": ["role", "href"], "count": 12}],
+    "post_link_ancestor_shapes": [
+      {
+        "chain": [
+          {"tag": "div", "role": "none_or_other", "attributes": []},
+          {"tag": "div", "role": "none_or_other", "attributes": []},
+          {"tag": "div", "role": "none_or_other", "attributes": []},
+          {"tag": "div", "role": "none_or_other", "attributes": []},
+          {"tag": "div", "role": "none_or_other", "attributes": []},
+          {"tag": "div", "role": "none_or_other", "attributes": []}
+        ],
+        "inside_panel": false,
+        "inside_grid": false,
+        "inside_excluded_region": false,
+        "count": 12
+      }
+    ],
+    "anchor_inspection_truncated": false
+  }
+}

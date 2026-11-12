@@ -33,6 +33,7 @@ class AnalyzeJob:
     profile_username: str
     post_shortcode: str
     attempted_models: list[str] = field(default_factory=list)
+    reanalyze: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -47,6 +48,7 @@ class AnalyzeJob:
             profile_username=str(data["profile_username"]),
             post_shortcode=str(data["post_shortcode"]),
             attempted_models=[str(m) for m in attempted],
+            reanalyze=data.get("reanalyze", False) is True,
         )
 
 

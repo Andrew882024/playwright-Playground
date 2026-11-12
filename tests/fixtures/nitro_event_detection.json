@@ -1,0 +1,19 @@
+{
+  "post_shortcode": "DfQZTkcqcoR",
+  "reported_primary_author": "dvcatucsd",
+  "user_confirmed_image_post": true,
+  "user_reported_event_title": "NITRO",
+  "user_reported_event_master_id": 16,
+  "canonical_parent_id": 1669,
+  "canonical_parent_marker": "[eventmaster-import:instagram:playground:instagram_posts:1669]",
+  "marker_mapping_status": "verified_read_only_snapshot",
+  "mapping_evidence": "Read-only PostgreSQL shortcode lookup and read-only MySQL marker/source lookup; one matching event 16, no legacy child marker.",
+  "cover_regeneration_allowed": false,
+  "new_import_allowed": false,
+  "overwrite_allowed": false,
+  "verified_at": "2026-11-05T22:26:55.459120+00:00",
+  "matched_event_ids": [
+    16
+  ],
+  "live_state_requires_reverification_before_future_execution": true
+}

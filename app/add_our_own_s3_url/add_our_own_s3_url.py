@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
 import boto3
+from botocore.config import Config
 from sqlalchemy import func, or_, select
 
 from Blueprint_db import InstagramPosts, SessionLocal
@@ -112,12 +113,13 @@ def _s3_client():
     return boto3.client(
         "s3",
         region_name=region,
+        config=Config(connect_timeout=10, read_timeout=30, retries={"total_max_attempts": 3}),
         aws_access_key_id=ak,
         aws_secret_access_key=sk,
     )
 
 
-def rows_to_backfill(profile: str | None, limit: int | None) -> list[InstagramPosts]:
+def rows_to_backfill(profile: str | None, limit: int | None, *, post_id: int | None = None) -> list[InstagramPosts]:
     trimmed_main = func.nullif(func.trim(InstagramPosts.main_image_url), "")
     trimmed_own = func.nullif(func.trim(InstagramPosts.own_s3_url_for_main_image), "")
     stmt = (
@@ -133,6 +135,8 @@ def rows_to_backfill(profile: str | None, limit: int | None) -> list[InstagramPo
         )
         .order_by(InstagramPosts.id.asc())
     )
+    if post_id is not None:
+        stmt = stmt.where(InstagramPosts.id == post_id)
     if profile is not None:
         pn = profile.lstrip("@").strip()
         stmt = stmt.where(InstagramPosts.profile_username == pn)
@@ -142,13 +146,14 @@ def rows_to_backfill(profile: str | None, limit: int | None) -> list[InstagramPo
         return list(session.scalars(stmt).all())
 
 
-def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool) -> int:
+def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool, post_id: int | None = None, report: dict | None = None) -> int:
     bucket = (os.getenv("S3_BUCKET") or "").strip()
     region = (os.getenv("AWS_REGION") or "us-east-1").strip()
     if not bucket and not dry_run:
         raise RuntimeError("Missing S3_BUCKET in environment")
 
-    rows = rows_to_backfill(profile, limit)
+    if report is not None: report.update(attempted=0,succeeded=0,failed=0)
+    rows = rows_to_backfill(profile, limit, **({'post_id':post_id} if post_id is not None else {}))
     if not rows:
         print("No matching rows (is_event, main_image_url set, ai_analyzed, own_s3_url empty).")
         return 0
@@ -194,17 +199,18 @@ def run_backfill(*, profile: str | None, limit: int | None, dry_run: bool) -> in
             session.commit()
         print(f"[ok] id={row.id} shortcode={row.post_shortcode} -> {public_url}")
         ok += 1
+    if report is not None: report.update(attempted=len(rows),succeeded=ok,failed=len(rows)-ok)
     return ok
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(
         description="Backfill own_s3_url_for_main_image via S3 upload (is_event rows only).",
     )
     p.add_argument("--profile", type=str, default=None, help="Only this instagram_posts.profile_username")
     p.add_argument("--limit", type=int, default=None, help="Max rows to process")
     p.add_argument("--dry-run", action="store_true", help="List rows only; no download/S3/DB writes")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     n = run_backfill(profile=args.profile, limit=args.limit, dry_run=args.dry_run)
     print(f"Done. Processed successfully: {n}")
 
